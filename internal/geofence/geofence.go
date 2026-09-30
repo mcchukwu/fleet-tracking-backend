@@ -1,6 +1,6 @@
 // Package geofence holds the in-memory containment engine. This is
-// deliberately NOT a PostGIS query per ping.
-// Postgres is the system of record for geofence *definitions* (loaded once at startup, refreshed
+// deliberately NOT a PostGIS query per ping. Postgres is the system of
+// record for geofence *definitions* (loaded once at startup, refreshed
 // on a slow interval), but the actual "is this point inside this
 // polygon" check that sits in the sub-100ms hot path runs entirely
 // in-process against data already in memory.
@@ -63,9 +63,7 @@ type Cache struct {
 }
 
 func NewCache() *Cache {
-	return &Cache{
-		byTenant: make(map[string][]Polygon),
-	}
+	return &Cache{byTenant: make(map[string][]Polygon)}
 }
 
 // ContainingPolygons returns every polygon belonging to tenantID that
@@ -104,9 +102,8 @@ func (c *Cache) replace(byTenant map[string][]Polygon) {
 // produces for a POLYGON: Coordinates[0] is the exterior ring,
 // Coordinates[1:] would be holes (interior rings), which v1 ignores,
 // fleet geofences are yards and depots, not shapes with donut holes in
-// them. Note GeoJSON orders each point as [lng, lat], not [lat, lng],
-// the opposite of how most people say coordinates out loud, and a very
-// easy bug to introduce silently if you're not deliberate about it.
+// them. Note GeoJSON orders each point as [lng, lat], not [lat, lng].
+// the opposite of how most people say coordinates out loud.
 type geoJSONPolygon struct {
 	Type        string        `json:"type"`
 	Coordinates [][][]float64 `json:"coordinates"`

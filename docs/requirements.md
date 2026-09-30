@@ -1,4 +1,4 @@
-# Fleet Tracking Backend - Requirements
+# Fleet Tracking Backend Requirements
 
 ## 1. Purpose
 
@@ -11,7 +11,7 @@ The system is designed around a hot-path/cold-path split: Redis holds
 ephemeral, low-latency live state; PostgreSQL/PostGIS holds durable history
 and answers analytical spatial queries that are not latency-sensitive.
 
-Ingestion is protocol-agnostic by design. A simulated-vehicle adapter
+Ingestion is protocol-agnostic by design, a simulated-vehicle adapter
 (WebSocket) and real-hardware adapters (raw TCP/UDP speaking
 manufacturer-specific or standard protocols such as JT/T808) both feed the
 same internal ingestion pipeline, so no core logic needs to know or care
@@ -35,13 +35,16 @@ where a position update originated.
 
 | ID     | Requirement |
 |--------|-------------|
-| NFR-1  | **Throughput**: sustain 5,000+ concurrent WebSocket connections with no silently dropped position updates. "Dropped" is defined precisely: every update is either accepted and processed, or rejected with a counted, logged metric, never lost without record. |
-| NFR-2  | **Latency**: a geofence entry/exit alert is emitted within p99 < 100ms of the triggering position update being received by the server, measured end-to-end. |
+| NFR-1  | **Throughput**: sustain 5,000+ concurrent WebSocket connections with no silently dropped position updates. "Dropped" is defined precisely: every update is either accepted and processed, or rejected with a counted, logged metric - never lost without record. |
+| NFR-2  | **Latency**: a geofence entry/exit alert is emitted within p99 < 100ms of the triggering position update being received by the server, measured end-to-end, for on-time (non-superseded) data. A ping that arrives older than the most recent one already applied for its vehicle, a duplicate or a late arrival is excluded from live alerting by design (see FR-7); it does not get a delayed-but-eventually-correct alert. Reconstructing the fully correct historical record from late data is a cold-path (Phase 4) concern, not a live-alerting one. This is a deliberate scope narrowing, not an oversight: a universal buffering delay wide enough to catch realistic lateness (seconds) would break this NFR for all traffic to correctly handle a minority of it. |
 | NFR-3  | **Durability**: every accepted position update is eventually written to PostgreSQL, even if it was rejected on the hot path for being stale relative to a newer update. |
 | NFR-4  | **Correctness under disorder**: current live state and geofence events remain correct when position updates for the same vehicle arrive out of order. |
 | NFR-5  | **Observability**: the system exposes connection count, ingest rate, alert-latency distribution, and dropped-message count as metrics, so NFR-1 and NFR-2 are provable, not asserted. |
 | NFR-6  | **Scalability posture**: ingestion nodes are stateless; all live state lives in Redis, so additional ingestion instances can be added behind a load balancer without an architecture change. |
 | NFR-7  | **Cost**: the system runs on a single modest VM plus a managed or self-hosted Postgres/Redis instance; no message queue or stream-processing framework is introduced unless the measured throughput requires it. |
+| NFR-8  | **Reconnect-storm resilience**: new connection admission is rate-limited (token bucket), so a mass simultaneous reconnect (e.g. a carrier outage recovering) degrades gracefully, bounded accept rate, rather than the accept path itself becoming the bottleneck. |
+| NFR-9  | **Half-open connection detection**: a connection that stops sending data is detected and closed via an application-level idle deadline, not left open on the strength of a TCP session that may no longer exist behind carrier NAT. TCP keepalive alone is too slow (minutes) for this. |
+| NFR-10 | **Explicit, configurable backpressure policy**: queue-overflow behavior is a named, chosen policy (block / drop_oldest / drop_newest), not one hardcoded behavior. The correct choice depends on what the data represents (see docs/architecture notes). |
 
 ## 4. Scope Decisions (explicit, not implicit)
 
@@ -56,10 +59,21 @@ where a position update originated.
   queries (dwell time, coverage area), not the hot-path containment engine.
 - No dedicated "current state" table in PostgreSQL. Redis is the sole
   source of truth for live position; PostgreSQL holds only durable history.
+- All application code lives under `internal/` (compiler-enforced:
+  unimportable from outside this module).
+- Ingestion logic (worker pool, out-of-order handling, geofence
+  evaluation) lives in `internal/pipeline`, deliberately transport-agnostic.
+  `cmd/ingest`'s only job is translating WebSocket frames into
+  `pipeline.PositionPing` and calling `Submit`. The same entry point a
+  future real-hardware TCP adapter will call, without
+  duplicating any ingestion logic.
+- Two HTTP listeners in `cmd/ingest`: a public one exposing only
+  `/ws/ingest` (what untrusted devices connect to), and an internal-only
+  one exposing `/metrics/*` and `/debug/*`. The internal listener is not
+  meant to be reachable from wherever devices connect from.
 
 ## 5. Out of Scope for v1
 
 - Live video streaming from dashcams (event-triggered clip upload only).
-- Authentication/authorization hardening (handled by a separate
-  service)
+- Authentication/authorization hardening. 
 - Horizontal scale-out actually implemented (only architecturally enabled).

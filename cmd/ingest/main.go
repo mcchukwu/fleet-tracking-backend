@@ -1,26 +1,13 @@
-// ingestion server.
-//
-// Phase 1 shape unchanged: one goroutine per WS connection, reading only,
-// handing pings to a buffered channel; a fixed worker pool drains it.
-// Phase 2 adds, inside that same worker: an in-memory geofence containment
-// check against a Cache loaded once from Postgres at startup, transition
-// detection against per-vehicle state kept in Redis, and an in-memory
-// alert log used both to verify correctness and to measure the p99
-// alert-latency NFR.
-//
-// Deliberate Phase 2 simplification, stated explicitly rather than left
-// implicit: every incoming ping is evaluated against a single hardcoded
-// default tenant's geofences. Vehicles aren't yet resolved to a tenant on
-// the ingestion path. That resolution is real multi-tenant work worth
-// doing when there's an actual second tenant to test against, not
-// before, per the "earn it from measured requirements" rule.
+// cmd/ingest is the WebSocket adapter binary: it knows how to speak
+// WebSocket+JSON and how to admit/police connections, and nothing else.
+// Tis file's only job is translating WebSocket frames into pipeline.PositionPing.
 package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,97 +16,119 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/mcchukwu/fleet-tracking-backend/internal/alert"
+	"github.com/joho/godotenv"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/config"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/db"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/geofence"
-	"github.com/mcchukwu/fleet-tracking-backend/pkg/config"
-	"github.com/mcchukwu/fleet-tracking-backend/pkg/logger"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/pipeline"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/ratelimit"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/validator"
 	"github.com/redis/go-redis/v9"
 )
 
-// defaultTenantID must match the tenant id used in migrations/seed_dev.sql.
-const defaultTenantID = "00000000-0000-0000-0000-000000000001"
+const (
+	defaultTenantID   = "00000000-0000-0000-0000-000000000001"
+	channelBufferSize = 20_000
+	workerPoolSize    = 64
+)
 
-type PositionPing struct {
+// Connection-level counters. These live here, not in internal/pipeline,
+// because they're specific to this adapter's transport (accepting WS
+// connections, detecting idle ones), a future TCP adapter would keep
+// its own equivalent counters rather than share these.
+var (
+	acceptedCount   atomic.Int64
+	rejectedCount   atomic.Int64
+	idleClosedCount atomic.Int64
+)
+
+// wsPing is the wire format for the WS adapter specifically. Separate
+// from pipeline.PositionPing on purpose, so a change to the JSON wire
+// format never forces a change to the adapter-agnostic core type.
+type wsPing struct {
 	VehicleID  string    `json:"vehicle_id"`
 	Lat        float64   `json:"lat"`
 	Lon        float64   `json:"lon"`
 	SpeedKPH   float64   `json:"speed_kph,omitempty"`
 	HeadingDeg float64   `json:"heading_deg,omitempty"`
-	RecordedAt time.Time `json:"recorded_at"` // device/event timestamp
-
-	// ReceivedAt is set server-side the instant the frame is read off the
-	// socket — never populated from client JSON. This, not RecordedAt, is
-	// what NFR-2's "p99 < 100ms from receipt" is measured against.
-	ReceivedAt time.Time `json:"-"`
+	RecordedAt time.Time `json:"recorded_at"`
 }
 
-const (
-	channelBufferSize = 20_000
-	workerPoolSize    = 64
-	alertLogCapacity  = 100_000
-)
-
-var (
-	receivedCount atomic.Int64
-	droppedCount  atomic.Int64
-	redisErrCount atomic.Int64
-)
-
 func main() {
-	cfg := config.Load()
-	if err := config.Validate(cfg); err != nil {
-		logger.Error("invalid enviroment configuration: %s", err)
-		os.Exit(1)
-	}
-	logger.Info("loaded environment configuration")
+	log := slog.Default()
 
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		logger.Error("unable to reach redis")
-		os.Exit(1)
+	if err := godotenv.Load(); err != nil {
+		log.Debug("failed to load environment variables", "error", err)
 	}
-	logger.Info("connected to redis")
 
-	db, err := sql.Open("pgx", cfg.DBURL)
+	cfg, err := config.LoadIngest()
 	if err != nil {
-		logger.Error("unable to open postgres connection")
+		log.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("connected to postgres")
-	defer db.Close()
 
-	geoCache, err := geofence.LoadFromPostgres(context.Background(), db)
+	rdb, err := db.ConnectRedis(cfg.RedisAddr)
 	if err != nil {
-		logger.Error("unable to load geofences")
+		log.Error("cannot connect to redis", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("loaded geofences for tenant %s: %v", defaultTenantID, polygonNames(geoCache.AllPolygonIDs(defaultTenantID)))
+	defer rdb.Close()
 
-	alerts := alert.NewAlertLog(alertLogCapacity)
-	ingestCh := make(chan PositionPing, channelBufferSize)
+	pg, err := db.ConnectPostgres(cfg.PGDSN)
+	if err != nil {
+		log.Error("cannot connect to postgres", "error", err)
+		os.Exit(1)
+	}
+	defer pg.Close()
 
-	for range workerPoolSize {
-		go worker(rdb, geoCache, alerts, ingestCh)
+	geoCache, err := geofence.LoadFromPostgres(context.Background(), pg)
+	if err != nil {
+		log.Error("cannot load geofences", "error", err)
+		os.Exit(1)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws/ingest", func(w http.ResponseWriter, r *http.Request) {
-		handleConnection(w, r, ingestCh)
+	pl := pipeline.New(rdb, geoCache, pipeline.Config{
+		TenantID:          defaultTenantID,
+		OverflowPolicy:    cfg.OverflowPolicy,
+		ChannelBufferSize: channelBufferSize,
+		WorkerPoolSize:    workerPoolSize,
+	}, log)
+	pl.Start()
+
+	log.Info("geofences loaded", "tenant", defaultTenantID, "names", pl.PolygonNames())
+	log.Info("config",
+		"overflow_policy", cfg.OverflowPolicy, "idle_timeout", cfg.IdleTimeout,
+		"accept_rate", cfg.AcceptRate, "accept_burst", cfg.AcceptBurst,
+		"public_addr", cfg.ListenAddr, "admin_addr", cfg.AdminAddr)
+
+	acceptLimiter := ratelimit.NewTokenBucket(cfg.AcceptRate, cfg.AcceptBurst)
+
+	publicMux := http.NewServeMux()
+	publicMux.HandleFunc("/ws/ingest", func(w http.ResponseWriter, r *http.Request) {
+		handleConnection(w, r, pl, acceptLimiter, cfg.IdleTimeout, log)
 	})
-	mux.HandleFunc("/metrics/ingest", metricsIngestHandler(ingestCh))
-	mux.HandleFunc("/metrics/alerts", metricsAlertsHandler(alerts))
-	mux.HandleFunc("/debug/alerts", debugAlertsHandler(alerts))
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.AppPort,
-		Handler: mux,
-	}
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/metrics/ingest", metricsIngestHandler(pl))
+	adminMux.HandleFunc("/metrics/alerts", metricsAlertsHandler(pl))
+	adminMux.HandleFunc("/debug/alerts", debugAlertsHandler(pl))
+	adminMux.HandleFunc("/debug/vehicle", debugVehicleHandler(rdb))
+	adminMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	publicSrv := &http.Server{Addr: cfg.ListenAddr, Handler: publicMux}
+	adminSrv := &http.Server{Addr: cfg.AdminAddr, Handler: adminMux}
 
 	go func() {
-		logger.Info("ingest server listening...")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("unable to start ingest server")
+		log.Info("public ingest listener up", "addr", cfg.ListenAddr)
+		if err := publicSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("public server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+	go func() {
+		log.Info("internal admin listener up (metrics/debug — do not expose publicly)", "addr", cfg.AdminAddr)
+		if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("admin server error", "error", err)
 			os.Exit(1)
 		}
 	}()
@@ -127,145 +136,114 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	<-stop
-	logger.Info("shutting down")
-
+	log.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = publicSrv.Shutdown(ctx)
+	_ = adminSrv.Shutdown(ctx)
 }
 
-func handleConnection(w http.ResponseWriter, r *http.Request, ingestCh chan<- PositionPing) {
+// handleConnection is the entire WS adapter: admission-rate check, then a
+// read loop with a re-armed idle deadline per read (half-open detection),
+// validating each frame before translating it into a pipeline.PositionPing
+// and handing it to the pipeline. No ingestion logic lives here, only
+// "how to speak WebSocket safely."
+func handleConnection(
+	w http.ResponseWriter, r *http.Request, pl *pipeline.Pipeline,
+	acceptLimiter *ratelimit.TokenBucket, idleTimeout time.Duration, log *slog.Logger,
+) {
+	if !acceptLimiter.Allow() {
+		rejectedCount.Add(1)
+		http.Error(w, "connection admission rate exceeded, retry shortly", http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		logger.Info("websocket accept error")
+		log.Warn("accept error", "error", err)
 		return
 	}
 	defer conn.CloseNow()
+	acceptedCount.Add(1)
 
-	ctx := r.Context()
+	parentCtx := r.Context()
 	for {
-		var ping PositionPing
-		if err := wsjson.Read(ctx, conn, &ping); err != nil {
-			return
-		}
-		ping.ReceivedAt = time.Now() // stamped here, not by the client
-		receivedCount.Add(1)
-
-		select {
-		case ingestCh <- ping:
-		default:
-			droppedCount.Add(1)
-		}
-	}
-}
-
-// worker does three things per ping, in order: write current position to
-// Redis (Phase 1, unchanged), evaluate geofence containment against the
-// in-memory cache and diff it against the vehicle's previous inside-set
-// to find transitions, then record any transitions to the alert log with
-// latency measured from ReceivedAt to right now.
-func worker(rdb *redis.Client, geoCache *geofence.Cache, alerts *alert.AlertLog, ingestCh <-chan PositionPing) {
-	ctx := context.Background()
-	for ping := range ingestCh {
-		writePosition(ctx, rdb, ping)
-		evaluateGeofences(ctx, rdb, geoCache, alerts, ping)
-	}
-}
-
-func writePosition(ctx context.Context, rdb *redis.Client, ping PositionPing) {
-	key := fmt.Sprintf("vehicle:%s:state", ping.VehicleID)
-	_, err := rdb.HSet(ctx, key, map[string]any{
-		"lat":         ping.Lat,
-		"lon":         ping.Lon,
-		"speed_kph":   ping.SpeedKPH,
-		"heading_deg": ping.HeadingDeg,
-		"recorded_at": ping.RecordedAt.UnixMilli(),
-	}).Result()
-	if err != nil {
-		redisErrCount.Add(1)
-		logger.Info("redis write error for %s: %v", ping.VehicleID, err)
-	}
-}
-
-func evaluateGeofences(ctx context.Context, rdb *redis.Client, geoCache *geofence.Cache, alerts *alert.AlertLog, ping PositionPing) {
-	pt := geofence.Point{Lng: ping.Lon, Lat: ping.Lat}
-	currentHits := geoCache.ContainingPolygons(defaultTenantID, pt)
-
-	current := make(map[string]geofence.Polygon, len(currentHits))
-	for _, poly := range currentHits {
-		current[poly.ID] = poly
-	}
-
-	insideKey := fmt.Sprintf("vehicle:%s:inside_geofences", ping.VehicleID)
-	previousIDs, err := rdb.SMembers(ctx, insideKey).Result()
-	if err != nil {
-		logger.Info("redis smembers error for %s: %v", ping.VehicleID, err)
-		return
-	}
-	previous := make(map[string]bool, len(previousIDs))
-	for _, id := range previousIDs {
-		previous[id] = true
-	}
-
-	now := time.Now()
-
-	// Entered: in current, not in previous.
-	for id, poly := range current {
-		if !previous[id] {
-			rdb.SAdd(ctx, insideKey, id)
-			alerts.Record(alert.AlertEvent{
-				VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: poly.Name,
-				EventType: "enter", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt),
-			})
-		}
-	}
-	// Exited: in previous, not in current.
-	for id := range previous {
-		if _, stillIn := current[id]; !stillIn {
-			rdb.SRem(ctx, insideKey, id)
-			name := id
-			if poly, ok := geoCache.AllPolygonIDs(defaultTenantID)[id]; ok {
-				name = poly.Name
+		readCtx, cancel := context.WithTimeout(parentCtx, idleTimeout)
+		var raw wsPing
+		err := wsjson.Read(readCtx, conn, &raw)
+		deadlineExceeded := readCtx.Err() == context.DeadlineExceeded
+		cancel()
+		if err != nil {
+			if deadlineExceeded {
+				idleClosedCount.Add(1)
 			}
-			alerts.Record(alert.AlertEvent{
-				VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: name,
-				EventType: "exit", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt),
-			})
+			return // idle timeout, client close, or bad frame. connection is done either way
 		}
-	}
-}
 
-func metricsIngestHandler(ingestCh chan PositionPing) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]int64{
-			"received":       receivedCount.Load(),
-			"dropped":        droppedCount.Load(),
-			"redis_errors":   redisErrCount.Load(),
-			"queue_length":   int64(len(ingestCh)),
-			"queue_capacity": int64(cap(ingestCh)),
+		receivedAt := time.Now()
+		if err := validator.ValidatePing(raw.VehicleID, raw.Lat, raw.Lon, raw.RecordedAt); err != nil {
+			pl.RecordValidationError()
+			log.Warn("rejected invalid ping", "vehicle_id", raw.VehicleID, "error", err)
+			continue
+		}
+
+		pl.Submit(pipeline.PositionPing{
+			VehicleID: raw.VehicleID, Lat: raw.Lat, Lon: raw.Lon,
+			SpeedKPH: raw.SpeedKPH, HeadingDeg: raw.HeadingDeg,
+			RecordedAt: raw.RecordedAt, ReceivedAt: receivedAt,
 		})
 	}
 }
 
-func metricsAlertsHandler(alerts *alert.AlertLog) http.HandlerFunc {
+func metricsIngestHandler(pl *pipeline.Pipeline) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(alerts.LatencyPercentiles())
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"received":          pl.Received(),
+			"dropped":           pl.Dropped(),
+			"redis_errors":      pl.RedisErrors(),
+			"stale":             pl.Stale(),
+			"validation_errors": pl.ValidationErrors(),
+			"accepted":          acceptedCount.Load(),
+			"rejected":          rejectedCount.Load(),
+			"idle_closed":       idleClosedCount.Load(),
+			"queue_length":      pl.QueueLen(),
+			"queue_capacity":    pl.QueueCap(),
+		})
 	}
 }
 
-func debugAlertsHandler(alerts *alert.AlertLog) http.HandlerFunc {
+func metricsAlertsHandler(pl *pipeline.Pipeline) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(alerts.Snapshot())
+		_ = json.NewEncoder(w).Encode(pl.AlertLatencyPercentiles())
 	}
 }
 
-func polygonNames(polys map[string]geofence.Polygon) []string {
-	names := make([]string, 0, len(polys))
-	for _, p := range polys {
-		names = append(names, p.Name)
+func debugAlertsHandler(pl *pipeline.Pipeline) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(pl.RecentAlerts())
 	}
-	return names
+}
+
+// debugVehicleHandler exposes a vehicle's raw hot-path Redis state.
+// admin-only (see the two-listener split at the top of this file), used
+// by cmd/routetest to verify a stale ping never overwrote the real
+// current position.
+func debugVehicleHandler(rdb *redis.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "id query parameter is required", http.StatusBadRequest)
+			return
+		}
+		state, err := rdb.HGetAll(r.Context(), fmt.Sprintf("vehicle:%s:state", id)).Result()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(state)
+	}
 }

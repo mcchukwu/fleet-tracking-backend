@@ -1,31 +1,22 @@
-// Load generator for Phase 1's exit criteria:
-
-// open 5,000+ concurrent WebSocket connections against the ingest
-// server's simulator-facing endpoint and send a realistic per-vehicle
-// ping cadence, long enough to prove sustained throughput rather than a burst.
-//
-// Important scope note: this simulates against the WEBSOCKET adapter,
-// the interface a browser/demo client (or this simulator) speaks. It does
-// NOT simulate the real-hardware interface. Real trackers and dashcams
-// speak raw TCP/UDP in a manufacturer/standard-specific binary protocol
-// (e.g. JT/T808), not WebSocket + JSON. That's a separate adapter, built
-// in a later phase, feeding the same internal pipeline. This generator
-// proves the WS adapter and the core pipeline behind it; it says nothing
-// about the hardware adapters yet.
+// Load generator, extended with a storm mode
+// to actually exercise the reconnect-storm and half-open-detection
+// hardening added to the ingest server: this drives the WebSocket simulator
+// adapter, not a real-hardware interface.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	"github.com/mcchukwu/fleet-tracking-backend/pkg/logger"
 )
 
 type PositionPing struct {
@@ -41,21 +32,17 @@ func main() {
 	url := flag.String("url", "ws://localhost:8080/ws/ingest", "target ws endpoint")
 	vehicles := flag.Int("vehicles", 5000, "number of simulated vehicles (concurrent connections)")
 	interval := flag.Duration("interval", 7*time.Second, "average ping interval per vehicle")
-	duration := flag.Duration("duration", 2*time.Minute, "how long each vehicle keeps pinging")
+	duration := flag.Duration("duration", 2*time.Minute, "total run time per vehicle")
 	rampUp := flag.Duration("rampup", 10*time.Second, "time to open all connections over, to avoid a connection-storm at t=0")
+	storm := flag.Duration("storm", 0, "if >0, force every vehicle to disconnect and reconnect roughly this often, simulating a carrier outage — proves the reconnect-storm defence")
 	flag.Parse()
 
-	var connected, dialErrors, sent, sendErrors int64
+	var connected, dialErrors, dialRejected, sent, sendErrors, reconnects int64
 	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration+*rampUp+30*time.Second)
 	defer cancel()
 
-	// Stagger connection opens across rampUp instead of firing all 5,000
-	// at once, a real fleet doesn't power on simultaneously, and a
-	// simultaneous connection storm tests your accept-loop and OS socket
-	// limits more than it tests sustained ingestion, which is what this
-	// phase is actually trying to prove.
 	perConnDelay := time.Duration(0)
 	if *vehicles > 0 {
 		perConnDelay = *rampUp / time.Duration(*vehicles)
@@ -65,59 +52,120 @@ func main() {
 		wg.Add(1)
 		go func(vehicleID int) {
 			defer wg.Done()
-			simulateVehicle(ctx, *url, vehicleID, *interval, *duration,
-				&connected, &dialErrors, &sent, &sendErrors)
+			runVehicle(ctx, *url, vehicleID, *interval, *duration, *storm,
+				&connected, &dialErrors, &dialRejected, &sent, &sendErrors, &reconnects)
 		}(i)
 		time.Sleep(perConnDelay)
 	}
 
-	logger.Info("all %d connection goroutines launched, running for ~%s", *vehicles, *duration)
+	log.Printf("all %d connection goroutines launched, running for ~%s", *vehicles, *duration)
+	if *storm > 0 {
+		log.Printf("storm mode: forcing reconnects roughly every %s", *storm)
+	}
 	wg.Wait()
 
 	fmt.Printf(
-		"connected=%d dial_errors=%d sent=%d send_errors=%d\n",
-		atomic.LoadInt64(&connected), atomic.LoadInt64(&dialErrors),
-		atomic.LoadInt64(&sent), atomic.LoadInt64(&sendErrors),
+		"connected=%d dial_errors=%d dial_rejected=%d reconnects=%d sent=%d send_errors=%d\n",
+		atomic.LoadInt64(&connected), atomic.LoadInt64(&dialErrors), atomic.LoadInt64(&dialRejected),
+		atomic.LoadInt64(&reconnects), atomic.LoadInt64(&sent), atomic.LoadInt64(&sendErrors),
 	)
-	fmt.Println("compare `sent` above against the ingest server's /metrics/ingest " +
-		"`received` and `dropped` counters. sent should equal received, and " +
-		"dropped should be 0 for Phase 1 to pass.")
+	if *storm > 0 {
+		fmt.Println("check the server's /metrics/ingest: `rejected` should be > 0 " +
+			"(the storm actually hit the admission limiter) and `idle_closed` should " +
+			"stay near 0 (reconnects succeeded rather than going half-open). " +
+			"`dial_rejected` above counts this client's own 503s from the limiter — " +
+			"expected during a storm, and the client backs off and retries rather than giving up.")
+	} else {
+		fmt.Println("compare `sent` above against the ingest server's /metrics/ingest " +
+			"`received` and `dropped` counters — sent should equal received, and " +
+			"dropped should be 0 for Phase 1 to pass.")
+	}
 }
 
-func simulateVehicle(
-	ctx context.Context,
-	url string,
-	id int,
-	interval,
-	duration time.Duration,
-	connected,
-	dialErrors,
-	sent,
-	sendErrors *int64,
+// runVehicle runs one simulated vehicle for the full duration, split into
+// segments of at most `storm` length (or the whole duration if storm is
+// 0). At the end of each segment it closes the connection and redials,
+// this is what "force every vehicle to reconnect at once" means in
+// practice: not a shared broadcast signal, just every vehicle's own
+// clock reaching the same interval at roughly the same time, since they
+// all started within the same rampUp window. That's a closer analogue to
+// a real regional carrier outage than a perfectly synchronised signal
+// would be anyway. Real devices don't drop in the same nanosecond either.
+func runVehicle(
+	ctx context.Context, url string, id int, interval, totalDuration, storm time.Duration,
+	connected, dialErrors, dialRejected, sent, sendErrors, reconnects *int64,
 ) {
-	conn, _, err := websocket.Dial(ctx, url, nil)
-	if err != nil {
-		atomic.AddInt64(dialErrors, 1)
-		return
-	}
-	defer conn.CloseNow()
-	atomic.AddInt64(connected, 1)
+	overallDeadline := time.Now().Add(totalDuration)
+	first := true
+	for time.Now().Before(overallDeadline) {
+		segment := time.Until(overallDeadline)
+		if storm > 0 && storm < segment {
+			segment = storm
+		}
+		if !first {
+			atomic.AddInt64(reconnects, 1)
+		}
+		first = false
 
-	// Start each simulated vehicle somewhere in the Lagos area with a
-	// small random offset, then have it drift with each ping, realistic
-	// enough to exercise the pipeline without needing real route data.
+		conn, ok := dialWithBackoff(ctx, url, dialErrors, dialRejected)
+		if !ok {
+			return
+		}
+		atomic.AddInt64(connected, 1)
+		runSegment(ctx, conn, id, interval, segment, sent, sendErrors)
+	}
+}
+
+// dialWithBackoff retries on a 503 from the admission-rate limiter
+// (expected and correct behaviour during a storm) with jittered
+// exponential backoff, rather than treating a throttled connection
+// attempt as a failure. A real device's firmware does something
+// equivalent: it's what makes the limiter's slowdown effective instead
+// of just relocating the storm to the reconnect loop.
+func dialWithBackoff(ctx context.Context, url string, dialErrors, dialRejected *int64) (*websocket.Conn, bool) {
+	backoff := 200 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+	for {
+		conn, resp, err := websocket.Dial(ctx, url, nil)
+		if err == nil {
+			return conn, true
+		}
+		if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
+			atomic.AddInt64(dialRejected, 1)
+		} else {
+			atomic.AddInt64(dialErrors, 1)
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(backoff + time.Duration(rand.Int63n(int64(backoff)))):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
+func runSegment(
+	ctx context.Context, conn *websocket.Conn, id int, interval, segment time.Duration,
+	sent, sendErrors *int64,
+) {
+	defer conn.CloseNow()
+
 	lat := 6.5244 + rand.Float64()*0.1
 	lon := 3.3792 + rand.Float64()*0.1
 
-	deadline := time.Now().Add(duration)
+	deadline := time.Now().Add(segment)
 	for time.Now().Before(deadline) {
-		// Jitter the interval so 5,000 vehicles don't end up pinging in
-		// lockstep, which would understate real-world burstiness.
 		wait := interval/2 + time.Duration(rand.Int63n(int64(interval)))
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
+		}
+		if time.Now().After(deadline) {
+			return
 		}
 
 		lat += (rand.Float64() - 0.5) * 0.001
