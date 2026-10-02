@@ -28,6 +28,7 @@ type PositionPing struct {
 	HeadingDeg float64
 	RecordedAt time.Time // device/event timestamp
 	ReceivedAt time.Time // stamped by the adapter the instant it received the frame
+	Source     string    // e.g. "simulator", "tracker", "dashcam", set by the adapter
 }
 
 type AlertEvent struct {
@@ -40,6 +41,34 @@ type AlertEvent struct {
 }
 
 const alertLogCapacity = 100_000
+
+// Broadcaster and ColdPathSink are the pipeline's two optional output
+// ports, deliberately interfaces, not concrete types, so this package
+// stays ignorant of what (if anything) consumes its output, the same way
+// it stays ignorant of which transport produced its input. internal/hub
+// implements Broadcaster; internal/coldpath implements ColdPathSink.
+// Either or both may be nil, see SetBroadcaster/SetColdPathSink.
+type Broadcaster interface {
+	Publish(v any)
+}
+
+type ColdPathSink interface {
+	EnqueuePosition(ping PositionPing, tenantID string, applied bool)
+	EnqueueAlert(e AlertEvent, tenantID string)
+}
+
+// LiveUpdate is the message shape published to a Broadcaster. Defined
+// here, not in internal/hub, so the hub stays a generic "marshal and
+// fan out whatever it's given" mechanism with no knowledge of this
+// domain's message shapes.
+type LiveUpdate struct {
+	Type       string      `json:"type"` // "position" | "alert"
+	VehicleID  string      `json:"vehicle_id"`
+	Lat        float64     `json:"lat,omitempty"`
+	Lon        float64     `json:"lon,omitempty"`
+	RecordedAt time.Time   `json:"recorded_at,omitempty"`
+	Alert      *AlertEvent `json:"alert,omitempty"`
+}
 
 // applyPositionScript enforces "only a strictly newer ping wins" in one
 // atomic round trip. See Pipeline.applyPosition for why a plain
@@ -69,12 +98,22 @@ type Pipeline struct {
 	ingestCh chan PositionPing
 	alerts   *alertLog
 
+	broadcaster Broadcaster  // optional; nil until SetBroadcaster is called
+	coldSink    ColdPathSink // optional; nil until SetColdPathSink is called
+
 	receivedCount      atomic.Int64
 	droppedCount       atomic.Int64
 	redisErrCount      atomic.Int64
 	staleCount         atomic.Int64
 	validationErrCount atomic.Int64
 }
+
+// SetBroadcaster and SetColdPathSink wire optional output ports in after
+// construction. Call before Start(); nil is a valid, supported value,
+// the pipeline works standalone with neither wired in, which is exactly
+// what let Phases 1-3 ship before either existed.
+func (p *Pipeline) SetBroadcaster(b Broadcaster)   { p.broadcaster = b }
+func (p *Pipeline) SetColdPathSink(s ColdPathSink) { p.coldSink = s }
 
 func New(rdb *redis.Client, geoCache *geofence.Cache, cfg Config, log *slog.Logger) *Pipeline {
 	return &Pipeline{
@@ -137,18 +176,38 @@ func (p *Pipeline) worker() {
 		if err != nil {
 			p.redisErrCount.Add(1)
 			p.log.Error("redis apply-position failed", "vehicle_id", ping.VehicleID, "error", err)
+			// Known limitation, stated rather than hidden: a ping that
+			// fails here (a transient Redis error, not a stale/duplicate
+			// one) is not enqueued to the cold path either. Durability
+			// across a Redis outage specifically is further hardening,
+			// not this phase's scope.
 			continue
 		}
+
+		if p.coldSink != nil {
+			p.coldSink.EnqueuePosition(ping, p.cfg.TenantID, applied)
+		}
+
 		if !applied {
 			// Older than (or equal to) what's already applied for this
 			// vehicle: a duplicate or a late arrival. Counted, not
 			// silently dropped, and deliberately excluded from live
-			// geofence evaluation, see the package-level doc comment in
-			// cmd/ingest/main.go for the full reasoning on why this is
-			// the right trade against NFR-2's latency budget.
+			// geofence evaluation and live broadcast, see the
+			// package-level doc comment in cmd/ingest/main.go for the
+			// full reasoning on why this is the right trade against
+			// NFR-2's latency budget. It still reached the cold path
+			// above, which is what keeps history durable.
 			p.staleCount.Add(1)
 			continue
 		}
+
+		if p.broadcaster != nil {
+			p.broadcaster.Publish(LiveUpdate{
+				Type: "position", VehicleID: ping.VehicleID,
+				Lat: ping.Lat, Lon: ping.Lon, RecordedAt: ping.RecordedAt,
+			})
+		}
+
 		p.evaluateGeofences(ctx, ping)
 	}
 }
@@ -159,7 +218,7 @@ func (p *Pipeline) worker() {
 // not a Go-side check-then-set, with 64 workers, two pings for the same
 // vehicle processed concurrently is rare but not impossible, and a
 // check-then-set race there would silently undermine the exact
-// correctness property
+// correctness property this phase exists to guarantee.
 func (p *Pipeline) applyPosition(ctx context.Context, ping PositionPing) (bool, error) {
 	key := fmt.Sprintf("vehicle:%s:state", ping.VehicleID)
 	result, err := applyPositionScript.Run(ctx, p.rdb, []string{key},
@@ -195,8 +254,10 @@ func (p *Pipeline) evaluateGeofences(ctx context.Context, ping PositionPing) {
 	for id, poly := range current {
 		if !previous[id] {
 			p.rdb.SAdd(ctx, insideKey, id)
-			p.alerts.record(AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: poly.Name,
-				EventType: "enter", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)})
+			event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: poly.Name,
+				EventType: "enter", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
+			p.alerts.record(event)
+			p.publishAlert(event)
 		}
 	}
 	for id := range previous {
@@ -206,9 +267,24 @@ func (p *Pipeline) evaluateGeofences(ctx context.Context, ping PositionPing) {
 			if poly, ok := p.geoCache.AllPolygonIDs(p.cfg.TenantID)[id]; ok {
 				name = poly.Name
 			}
-			p.alerts.record(AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: name,
-				EventType: "exit", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)})
+			event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: name,
+				EventType: "exit", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
+			p.alerts.record(event)
+			p.publishAlert(event)
 		}
+	}
+}
+
+// publishAlert enqueues an alert to the cold path and broadcasts it to
+// live dashboard clients, the two things every alert should reach,
+// factored out so the enter/exit branches above don't each repeat the
+// nil-checks.
+func (p *Pipeline) publishAlert(event AlertEvent) {
+	if p.coldSink != nil {
+		p.coldSink.EnqueueAlert(event, p.cfg.TenantID)
+	}
+	if p.broadcaster != nil {
+		p.broadcaster.Publish(LiveUpdate{Type: "alert", VehicleID: event.VehicleID, Alert: &event})
 	}
 }
 

@@ -17,9 +17,11 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/joho/godotenv"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/coldpath"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/config"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/db"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/geofence"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/hub"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/pipeline"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/ratelimit"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/validator"
@@ -30,6 +32,7 @@ const (
 	defaultTenantID   = "00000000-0000-0000-0000-000000000001"
 	channelBufferSize = 20_000
 	workerPoolSize    = 64
+	coldPathQueueSize = 20_000
 )
 
 // Connection-level counters. These live here, not in internal/pipeline,
@@ -93,12 +96,24 @@ func main() {
 		ChannelBufferSize: channelBufferSize,
 		WorkerPoolSize:    workerPoolSize,
 	}, log)
+
+	coldWriter := coldpath.NewWriter(pg, log, coldPathQueueSize)
+	coldWriter.Start(cfg.ColdPathBatchWindow, cfg.ColdPathBatchSize)
+	pl.SetColdPathSink(coldWriter)
+
+	liveHub := hub.New(log)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go liveHub.Run(hubCtx)
+	pl.SetBroadcaster(liveHub)
+
 	pl.Start()
 
 	log.Info("geofences loaded", "tenant", defaultTenantID, "names", pl.PolygonNames())
 	log.Info("config",
 		"overflow_policy", cfg.OverflowPolicy, "idle_timeout", cfg.IdleTimeout,
 		"accept_rate", cfg.AcceptRate, "accept_burst", cfg.AcceptBurst,
+		"coldpath_batch_window", cfg.ColdPathBatchWindow, "coldpath_batch_size", cfg.ColdPathBatchSize,
 		"public_addr", cfg.ListenAddr, "admin_addr", cfg.AdminAddr)
 
 	acceptLimiter := ratelimit.NewTokenBucket(cfg.AcceptRate, cfg.AcceptBurst)
@@ -109,10 +124,11 @@ func main() {
 	})
 
 	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("/metrics/ingest", metricsIngestHandler(pl))
+	adminMux.HandleFunc("/metrics/ingest", metricsIngestHandler(pl, coldWriter))
 	adminMux.HandleFunc("/metrics/alerts", metricsAlertsHandler(pl))
 	adminMux.HandleFunc("/debug/alerts", debugAlertsHandler(pl))
 	adminMux.HandleFunc("/debug/vehicle", debugVehicleHandler(rdb))
+	adminMux.HandleFunc("/ws/live", liveHub.ServeWS)
 	adminMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	publicSrv := &http.Server{Addr: cfg.ListenAddr, Handler: publicMux}
@@ -177,7 +193,7 @@ func handleConnection(
 			if deadlineExceeded {
 				idleClosedCount.Add(1)
 			}
-			return // idle timeout, client close, or bad frame. connection is done either way
+			return // idle timeout, client close, or bad frame, connection is done either way
 		}
 
 		receivedAt := time.Now()
@@ -190,25 +206,27 @@ func handleConnection(
 		pl.Submit(pipeline.PositionPing{
 			VehicleID: raw.VehicleID, Lat: raw.Lat, Lon: raw.Lon,
 			SpeedKPH: raw.SpeedKPH, HeadingDeg: raw.HeadingDeg,
-			RecordedAt: raw.RecordedAt, ReceivedAt: receivedAt,
+			RecordedAt: raw.RecordedAt, ReceivedAt: receivedAt, Source: "simulator",
 		})
 	}
 }
 
-func metricsIngestHandler(pl *pipeline.Pipeline) http.HandlerFunc {
+func metricsIngestHandler(pl *pipeline.Pipeline, cw *coldpath.Writer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"received":          pl.Received(),
-			"dropped":           pl.Dropped(),
-			"redis_errors":      pl.RedisErrors(),
-			"stale":             pl.Stale(),
-			"validation_errors": pl.ValidationErrors(),
-			"accepted":          acceptedCount.Load(),
-			"rejected":          rejectedCount.Load(),
-			"idle_closed":       idleClosedCount.Load(),
-			"queue_length":      pl.QueueLen(),
-			"queue_capacity":    pl.QueueCap(),
+			"received":                   pl.Received(),
+			"dropped":                    pl.Dropped(),
+			"redis_errors":               pl.RedisErrors(),
+			"stale":                      pl.Stale(),
+			"validation_errors":          pl.ValidationErrors(),
+			"accepted":                   acceptedCount.Load(),
+			"rejected":                   rejectedCount.Load(),
+			"idle_closed":                idleClosedCount.Load(),
+			"queue_length":               pl.QueueLen(),
+			"queue_capacity":             pl.QueueCap(),
+			"coldpath_dropped_positions": cw.DroppedPositions(),
+			"coldpath_dropped_alerts":    cw.DroppedAlerts(),
 		})
 	}
 }
@@ -227,7 +245,7 @@ func debugAlertsHandler(pl *pipeline.Pipeline) http.HandlerFunc {
 	}
 }
 
-// debugVehicleHandler exposes a vehicle's raw hot-path Redis state.
+// debugVehicleHandler exposes a vehicle's raw hot-path Redis state
 // admin-only (see the two-listener split at the top of this file), used
 // by cmd/routetest to verify a stale ping never overwrote the real
 // current position.
