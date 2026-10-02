@@ -69,11 +69,11 @@ type Pipeline struct {
 	ingestCh chan PositionPing
 	alerts   *alertLog
 
-	receivedCount      int64
-	droppedCount       int64
-	redisErrCount      int64
-	staleCount         int64
-	validationErrCount int64
+	receivedCount      atomic.Int64
+	droppedCount       atomic.Int64
+	redisErrCount      atomic.Int64
+	staleCount         atomic.Int64
+	validationErrCount atomic.Int64
 }
 
 func New(rdb *redis.Client, geoCache *geofence.Cache, cfg Config, log *slog.Logger) *Pipeline {
@@ -89,7 +89,7 @@ func New(rdb *redis.Client, geoCache *geofence.Cache, cfg Config, log *slog.Logg
 
 // Start launches the worker pool. Call once, after construction.
 func (p *Pipeline) Start() {
-	for i := 0; i < p.cfg.WorkerPoolSize; i++ {
+	for range p.cfg.WorkerPoolSize {
 		go p.worker()
 	}
 }
@@ -98,7 +98,7 @@ func (p *Pipeline) Start() {
 // Counting a received ping happens here, centrally, so every adapter's
 // traffic is counted the same way regardless of transport.
 func (p *Pipeline) Submit(ping PositionPing) {
-	atomic.AddInt64(&p.receivedCount, 1)
+	p.receivedCount.Add(1)
 	switch p.cfg.OverflowPolicy {
 	case "block":
 		p.ingestCh <- ping
@@ -113,14 +113,14 @@ func (p *Pipeline) Submit(ping PositionPing) {
 			select {
 			case p.ingestCh <- ping:
 			default:
-				atomic.AddInt64(&p.droppedCount, 1)
+				p.droppedCount.Add(1)
 			}
 		}
 	default: // "drop_newest"
 		select {
 		case p.ingestCh <- ping:
 		default:
-			atomic.AddInt64(&p.droppedCount, 1)
+			p.droppedCount.Add(1)
 		}
 	}
 }
@@ -128,14 +128,14 @@ func (p *Pipeline) Submit(ping PositionPing) {
 // RecordValidationError lets an adapter report a ping it rejected before
 // even calling Submit (e.g. failed internal/validator checks), so that
 // traffic is visible in the same metrics rather than silently invisible.
-func (p *Pipeline) RecordValidationError() { atomic.AddInt64(&p.validationErrCount, 1) }
+func (p *Pipeline) RecordValidationError() { p.validationErrCount.Add(1) }
 
 func (p *Pipeline) worker() {
 	ctx := context.Background()
 	for ping := range p.ingestCh {
 		applied, err := p.applyPosition(ctx, ping)
 		if err != nil {
-			atomic.AddInt64(&p.redisErrCount, 1)
+			p.redisErrCount.Add(1)
 			p.log.Error("redis apply-position failed", "vehicle_id", ping.VehicleID, "error", err)
 			continue
 		}
@@ -146,7 +146,7 @@ func (p *Pipeline) worker() {
 			// geofence evaluation, see the package-level doc comment in
 			// cmd/ingest/main.go for the full reasoning on why this is
 			// the right trade against NFR-2's latency budget.
-			atomic.AddInt64(&p.staleCount, 1)
+			p.staleCount.Add(1)
 			continue
 		}
 		p.evaluateGeofences(ctx, ping)
@@ -216,12 +216,12 @@ func (p *Pipeline) evaluateGeofences(ctx context.Context, ping PositionPing) {
 
 func (p *Pipeline) QueueLen() int      { return len(p.ingestCh) }
 func (p *Pipeline) QueueCap() int      { return cap(p.ingestCh) }
-func (p *Pipeline) Received() int64    { return atomic.LoadInt64(&p.receivedCount) }
-func (p *Pipeline) Dropped() int64     { return atomic.LoadInt64(&p.droppedCount) }
-func (p *Pipeline) RedisErrors() int64 { return atomic.LoadInt64(&p.redisErrCount) }
-func (p *Pipeline) Stale() int64       { return atomic.LoadInt64(&p.staleCount) }
+func (p *Pipeline) Received() int64    { return p.receivedCount.Load() }
+func (p *Pipeline) Dropped() int64     { return p.droppedCount.Load() }
+func (p *Pipeline) RedisErrors() int64 { return p.redisErrCount.Load() }
+func (p *Pipeline) Stale() int64       { return p.staleCount.Load() }
 func (p *Pipeline) ValidationErrors() int64 {
-	return atomic.LoadInt64(&p.validationErrCount)
+	return p.validationErrCount.Load()
 }
 func (p *Pipeline) RecentAlerts() []AlertEvent                  { return p.alerts.snapshot() }
 func (p *Pipeline) AlertLatencyPercentiles() map[string]float64 { return p.alerts.latencyPercentiles() }

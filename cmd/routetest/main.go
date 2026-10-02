@@ -73,7 +73,7 @@ func main() {
 		*steps, *vehicleID, startLng, endLng, lat)
 
 	var lastRecordedAt time.Time
-	for i := 0; i < *steps; i++ {
+	for i := range *steps {
 		frac := float64(i) / float64(*steps-1)
 		lng := startLng + frac*(endLng-startLng)
 		now := time.Now()
