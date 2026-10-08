@@ -1,17 +1,24 @@
-APP_NAME := fleet-tracking-backend
-CMD_PATH := ./cmd
 BIN_PATH := bin
 
-.PHONY: run build clean test
+.PHONY: run build clean test vet integration
 
-run: 
-	go run $(CMD_PATH)
+run:
+	go run ./cmd/ingest
 
 build:
-	go build -o $(BIN_PATH)/$(APP_NAME) $(CMD_PATH)
+	mkdir -p $(BIN_PATH)
+	go build -o $(BIN_PATH)/ingest ./cmd/ingest
+	go build -o $(BIN_PATH)/loadgen ./cmd/loadgen
+	go build -o $(BIN_PATH)/routetest ./cmd/routetest
 
 clean:
 	rm -rf $(BIN_PATH)
 
 test:
 	go test ./...
+
+vet:
+	go vet ./...
+
+integration:
+	./scripts/integration.sh
