@@ -1,7 +1,6 @@
 // Package geofence holds the in-memory containment engine. This is
 // deliberately NOT a PostGIS query per ping. Postgres is the system of
-// record for geofence *definitions* (loaded once at startup, refreshed
-// on a slow interval), but the actual "is this point inside this
+// record for geofence *definitions* (loaded at startup), but the actual "is this point inside this
 // polygon" check that sits in the sub-100ms hot path runs entirely
 // in-process against data already in memory.
 package geofence
@@ -62,8 +61,12 @@ type Cache struct {
 	byTenant map[string][]Polygon
 }
 
-func NewCache() *Cache {
-	return &Cache{byTenant: make(map[string][]Polygon)}
+func NewCache(polygons ...Polygon) *Cache {
+	byTenant := make(map[string][]Polygon)
+	for _, polygon := range polygons {
+		byTenant[polygon.TenantID] = append(byTenant[polygon.TenantID], polygon)
+	}
+	return &Cache{byTenant: byTenant}
 }
 
 // ContainingPolygons returns every polygon belonging to tenantID that

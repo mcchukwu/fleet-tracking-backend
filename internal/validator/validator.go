@@ -5,6 +5,7 @@
 package validator
 
 import (
+	"math"
 	"time"
 
 	"github.com/mcchukwu/fleet-tracking-backend/internal/apperrors"
@@ -20,6 +21,12 @@ const MaxClockSkew = 5 * time.Minute
 func ValidatePing(vehicleID string, lat, lon float64, recordedAt time.Time) error {
 	if vehicleID == "" {
 		return apperrors.Validation("vehicle_id is required")
+	}
+	if math.IsNaN(lat) || math.IsInf(lat, 0) {
+		return apperrors.Validation("lat must be finite")
+	}
+	if math.IsNaN(lon) || math.IsInf(lon, 0) {
+		return apperrors.Validation("lon must be finite")
 	}
 	if lat < -90 || lat > 90 {
 		return apperrors.Validation("lat %f out of range [-90, 90]", lat)

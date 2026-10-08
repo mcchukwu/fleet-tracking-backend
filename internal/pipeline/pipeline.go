@@ -70,16 +70,45 @@ type LiveUpdate struct {
 	Alert      *AlertEvent `json:"alert,omitempty"`
 }
 
-// applyPositionScript enforces "only a strictly newer ping wins" in one
-// atomic round trip. See Pipeline.applyPosition for why a plain
-// check-then-set on the Go side isn't good enough.
+// applyPositionScript atomically applies a newer position and replaces the
+// vehicle's geofence membership. Keeping both operations in Redis prevents
+// concurrent workers or ingestion instances from emitting duplicate or
+// inverted transitions for the same vehicle.
 var applyPositionScript = redis.NewScript(`
 local existing = redis.call('HGET', KEYS[1], 'recorded_at')
-if existing and tonumber(existing) >= tonumber(ARGV[1]) then
-    return 0
+if existing and existing >= ARGV[1] then
+    return {0, {}, {}}
 end
 redis.call('HSET', KEYS[1], 'lat', ARGV[2], 'lon', ARGV[3], 'speed_kph', ARGV[4], 'heading_deg', ARGV[5], 'recorded_at', ARGV[1])
-return 1
+
+local current = {}
+for i = 6, #ARGV do
+    current[ARGV[i]] = true
+end
+
+local previous = redis.call('SMEMBERS', KEYS[2])
+local previousSet = {}
+for _, id in ipairs(previous) do
+    previousSet[id] = true
+end
+
+local entered = {}
+for id, _ in pairs(current) do
+    if not previousSet[id] then
+        redis.call('SADD', KEYS[2], id)
+        table.insert(entered, id)
+    end
+end
+
+local exited = {}
+for _, id in ipairs(previous) do
+    if not current[id] then
+        redis.call('SREM', KEYS[2], id)
+        table.insert(exited, id)
+    end
+end
+
+return {1, entered, exited}
 `)
 
 type Config struct {
@@ -147,6 +176,7 @@ func (p *Pipeline) Submit(ping PositionPing) {
 		default:
 			select {
 			case <-p.ingestCh:
+				p.droppedCount.Add(1)
 			default:
 			}
 			select {
@@ -172,7 +202,8 @@ func (p *Pipeline) RecordValidationError() { p.validationErrCount.Add(1) }
 func (p *Pipeline) worker() {
 	ctx := context.Background()
 	for ping := range p.ingestCh {
-		applied, err := p.applyPosition(ctx, ping)
+		current := p.containingPolygons(ping)
+		applied, entered, exited, err := p.applyPosition(ctx, ping, current)
 		if err != nil {
 			p.redisErrCount.Add(1)
 			p.log.Error("redis apply-position failed", "vehicle_id", ping.VehicleID, "error", err)
@@ -196,7 +227,7 @@ func (p *Pipeline) worker() {
 			// package-level doc comment in cmd/ingest/main.go for the
 			// full reasoning on why this is the right trade against
 			// NFR-2's latency budget. It still reached the cold path
-			// above, which is what keeps history durable.
+			// above, which makes it eligible for cold-path persistence.
 			p.staleCount.Add(1)
 			continue
 		}
@@ -208,71 +239,96 @@ func (p *Pipeline) worker() {
 			})
 		}
 
-		p.evaluateGeofences(ctx, ping)
+		p.publishTransitions(ping, current, entered, exited)
 	}
 }
 
-// applyPosition returns applied=true only if ping.RecordedAt is strictly
-// newer than whatever is currently stored for the vehicle (or nothing is
-// stored yet). The compare-and-write happens in one atomic Redis script,
-// not a Go-side check-then-set, with 64 workers, two pings for the same
-// vehicle processed concurrently is rare but not impossible, and a
-// check-then-set race there would silently undermine the exact
-// correctness property this phase exists to guarantee.
-func (p *Pipeline) applyPosition(ctx context.Context, ping PositionPing) (bool, error) {
-	key := fmt.Sprintf("vehicle:%s:state", ping.VehicleID)
-	result, err := applyPositionScript.Run(ctx, p.rdb, []string{key},
-		ping.RecordedAt.UnixMilli(), ping.Lat, ping.Lon, ping.SpeedKPH, ping.HeadingDeg,
-	).Int()
-	if err != nil {
-		return false, err
-	}
-	return result == 1, nil
-}
-
-func (p *Pipeline) evaluateGeofences(ctx context.Context, ping PositionPing) {
-	pt := geofence.Point{Lng: ping.Lon, Lat: ping.Lat}
-	currentHits := p.geoCache.ContainingPolygons(p.cfg.TenantID, pt)
-
+func (p *Pipeline) containingPolygons(ping PositionPing) map[string]geofence.Polygon {
+	currentHits := p.geoCache.ContainingPolygons(p.cfg.TenantID, geofence.Point{Lng: ping.Lon, Lat: ping.Lat})
 	current := make(map[string]geofence.Polygon, len(currentHits))
 	for _, poly := range currentHits {
 		current[poly.ID] = poly
 	}
+	return current
+}
 
+// applyPosition returns the transitions that belong to a newer ping. The
+// timestamp is a fixed-width UTC string, so Redis/Lua can compare it exactly;
+// numeric Unix nanoseconds would lose precision in Lua's floating point type.
+func (p *Pipeline) applyPosition(
+	ctx context.Context, ping PositionPing, current map[string]geofence.Polygon,
+) (bool, []string, []string, error) {
+	key := fmt.Sprintf("vehicle:%s:state", ping.VehicleID)
 	insideKey := fmt.Sprintf("vehicle:%s:inside_geofences", ping.VehicleID)
-	previousIDs, err := p.rdb.SMembers(ctx, insideKey).Result()
+	args := make([]any, 0, 5+len(current))
+	args = append(args,
+		ping.RecordedAt.UTC().Format("2006-01-02T15:04:05.000000000Z"),
+		ping.Lat, ping.Lon, ping.SpeedKPH, ping.HeadingDeg,
+	)
+	for id := range current {
+		args = append(args, id)
+	}
+	result, err := applyPositionScript.Run(ctx, p.rdb, []string{key, insideKey}, args...).Result()
 	if err != nil {
-		p.log.Error("redis smembers failed", "vehicle_id", ping.VehicleID, "error", err)
-		return
+		return false, nil, nil, err
 	}
-	previous := make(map[string]bool, len(previousIDs))
-	for _, id := range previousIDs {
-		previous[id] = true
+	values, ok := result.([]any)
+	if !ok || len(values) != 3 {
+		return false, nil, nil, fmt.Errorf("unexpected apply-position response %T", result)
 	}
+	applied, ok := values[0].(int64)
+	if !ok {
+		return false, nil, nil, fmt.Errorf("unexpected apply-position status %T", values[0])
+	}
+	entered, err := redisIDs(values[1])
+	if err != nil {
+		return false, nil, nil, err
+	}
+	exited, err := redisIDs(values[2])
+	if err != nil {
+		return false, nil, nil, err
+	}
+	return applied == 1, entered, exited, nil
+}
 
+func (p *Pipeline) publishTransitions(
+	ping PositionPing, current map[string]geofence.Polygon, entered, exited []string,
+) {
 	now := time.Now()
-	for id, poly := range current {
-		if !previous[id] {
-			p.rdb.SAdd(ctx, insideKey, id)
-			event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: poly.Name,
-				EventType: "enter", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
-			p.alerts.record(event)
-			p.publishAlert(event)
-		}
+	for _, id := range entered {
+		poly := current[id]
+		event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: poly.Name,
+			EventType: "enter", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
+		p.alerts.record(event)
+		p.publishAlert(event)
 	}
-	for id := range previous {
-		if _, stillIn := current[id]; !stillIn {
-			p.rdb.SRem(ctx, insideKey, id)
-			name := id
-			if poly, ok := p.geoCache.AllPolygonIDs(p.cfg.TenantID)[id]; ok {
-				name = poly.Name
-			}
-			event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: name,
-				EventType: "exit", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
-			p.alerts.record(event)
-			p.publishAlert(event)
+	allPolygons := p.geoCache.AllPolygonIDs(p.cfg.TenantID)
+	for _, id := range exited {
+		name := id
+		if poly, ok := allPolygons[id]; ok {
+			name = poly.Name
 		}
+		event := AlertEvent{VehicleID: ping.VehicleID, GeofenceID: id, GeofenceName: name,
+			EventType: "exit", EventTime: ping.RecordedAt, Latency: now.Sub(ping.ReceivedAt)}
+		p.alerts.record(event)
+		p.publishAlert(event)
 	}
+}
+
+func redisIDs(value any) ([]string, error) {
+	values, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("unexpected Redis ID list %T", value)
+	}
+	ids := make([]string, len(values))
+	for i, value := range values {
+		id, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("unexpected Redis ID type %T", value)
+		}
+		ids[i] = id
+	}
+	return ids, nil
 }
 
 // publishAlert enqueues an alert to the cold path and broadcasts it to
@@ -334,12 +390,14 @@ func (a *alertLog) record(e AlertEvent) {
 func (a *alertLog) snapshot() []AlertEvent {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	n := a.next
-	if a.filled {
-		n = len(a.events)
+	if !a.filled {
+		out := make([]AlertEvent, a.next)
+		copy(out, a.events[:a.next])
+		return out
 	}
-	out := make([]AlertEvent, n)
-	copy(out, a.events[:n])
+	out := make([]AlertEvent, len(a.events))
+	n := copy(out, a.events[a.next:])
+	copy(out[n:], a.events[:a.next])
 	return out
 }
 
