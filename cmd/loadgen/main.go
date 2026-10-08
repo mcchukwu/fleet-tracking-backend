@@ -1,6 +1,12 @@
 // Load generator, extended with a storm mode
-// to actually exercise the reconnect-storm and half-open-detection
-// hardening added to the ingest server: this drives the WebSocket simulator
+// (reconnect-storm defence) and, now, device authentication: every
+// simulated vehicle dials with an Authorization bearer token and an
+// X-Device-ID header, matching what cmd/ingest now requires. Without
+// -api-key set to a valid key for the target tenant, every connection
+// will be rejected with 401, that's the server behaving correctly, not
+// a bug in this tool.
+//
+// this drives the WebSocket simulator
 // adapter, not a real-hardware interface.
 package main
 
@@ -19,8 +25,9 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
+// PositionPing carries no identity field, identity comes from the
+// authenticated connection (X-Device-ID), matching cmd/ingest's wsPing.
 type PositionPing struct {
-	VehicleID  string    `json:"vehicle_id"`
 	Lat        float64   `json:"lat"`
 	Lon        float64   `json:"lon"`
 	SpeedKPH   float64   `json:"speed_kph,omitempty"`
@@ -28,8 +35,13 @@ type PositionPing struct {
 	RecordedAt time.Time `json:"recorded_at"`
 }
 
+type counters struct {
+	connected, dialErrors, dialRejected, sent, sendErrors, reconnects atomic.Int64
+}
+
 func main() {
 	url := flag.String("url", "ws://localhost:8080/ws/ingest", "target ws endpoint")
+	apiKey := flag.String("api-key", "dev-local-only-key", "tenant API key (matches migrations/seed_dev.sql's dev key by default)")
 	vehicles := flag.Int("vehicles", 5000, "number of simulated vehicles (concurrent connections)")
 	interval := flag.Duration("interval", 7*time.Second, "average ping interval per vehicle")
 	duration := flag.Duration("duration", 2*time.Minute, "total run time per vehicle")
@@ -37,7 +49,7 @@ func main() {
 	storm := flag.Duration("storm", 0, "if >0, force every vehicle to disconnect and reconnect roughly this often, simulating a carrier outage — proves the reconnect-storm defence")
 	flag.Parse()
 
-	var connected, dialErrors, dialRejected, sent, sendErrors, reconnects int64
+	var c counters
 	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration+*rampUp+30*time.Second)
@@ -48,12 +60,11 @@ func main() {
 		perConnDelay = *rampUp / time.Duration(*vehicles)
 	}
 
-	for i := 0; i < *vehicles; i++ {
+	for i := range *vehicles {
 		wg.Add(1)
 		go func(vehicleID int) {
 			defer wg.Done()
-			runVehicle(ctx, *url, vehicleID, *interval, *duration, *storm,
-				&connected, &dialErrors, &dialRejected, &sent, &sendErrors, &reconnects)
+			runVehicle(ctx, *url, *apiKey, vehicleID, *interval, *duration, *storm, &c)
 		}(i)
 		time.Sleep(perConnDelay)
 	}
@@ -66,9 +77,14 @@ func main() {
 
 	fmt.Printf(
 		"connected=%d dial_errors=%d dial_rejected=%d reconnects=%d sent=%d send_errors=%d\n",
-		atomic.LoadInt64(&connected), atomic.LoadInt64(&dialErrors), atomic.LoadInt64(&dialRejected),
-		atomic.LoadInt64(&reconnects), atomic.LoadInt64(&sent), atomic.LoadInt64(&sendErrors),
+		c.connected.Load(), c.dialErrors.Load(), c.dialRejected.Load(),
+		c.reconnects.Load(), c.sent.Load(), c.sendErrors.Load(),
 	)
+	if c.dialErrors.Load() > 0 && c.connected.Load() == 0 {
+		fmt.Println("every dial failed — if these are 401s, check -api-key matches a seeded, " +
+			"non-revoked key, and that the dev tenant's auto_register_devices is true if these " +
+			"vehicle ids have never connected before.")
+	}
 	if *storm > 0 {
 		fmt.Println("check the server's /metrics/ingest: `rejected` should be > 0 " +
 			"(the storm actually hit the admission limiter) and `idle_closed` should " +
@@ -84,17 +100,9 @@ func main() {
 
 // runVehicle runs one simulated vehicle for the full duration, split into
 // segments of at most `storm` length (or the whole duration if storm is
-// 0). At the end of each segment it closes the connection and redials,
-// this is what "force every vehicle to reconnect at once" means in
-// practice: not a shared broadcast signal, just every vehicle's own
-// clock reaching the same interval at roughly the same time, since they
-// all started within the same rampUp window. That's a closer analogue to
-// a real regional carrier outage than a perfectly synchronised signal
-// would be anyway. Real devices don't drop in the same nanosecond either.
-func runVehicle(
-	ctx context.Context, url string, id int, interval, totalDuration, storm time.Duration,
-	connected, dialErrors, dialRejected, sent, sendErrors, reconnects *int64,
-) {
+// 0). At the end of each segment it closes the connection and redials.
+func runVehicle(ctx context.Context, url, apiKey string, id int, interval, totalDuration, storm time.Duration, c *counters) {
+	deviceID := fmt.Sprintf("sim-%d", id)
 	overallDeadline := time.Now().Add(totalDuration)
 	first := true
 	for time.Now().Before(overallDeadline) {
@@ -103,37 +111,41 @@ func runVehicle(
 			segment = storm
 		}
 		if !first {
-			atomic.AddInt64(reconnects, 1)
+			c.reconnects.Add(1)
 		}
 		first = false
 
-		conn, ok := dialWithBackoff(ctx, url, dialErrors, dialRejected)
+		conn, ok := dialWithBackoff(ctx, url, apiKey, deviceID, c)
 		if !ok {
 			return
 		}
-		atomic.AddInt64(connected, 1)
-		runSegment(ctx, conn, id, interval, segment, sent, sendErrors)
+		c.connected.Add(1)
+		runSegment(ctx, conn, interval, segment, c)
 	}
 }
 
 // dialWithBackoff retries on a 503 from the admission-rate limiter
-// (expected and correct behaviour during a storm) with jittered
-// exponential backoff, rather than treating a throttled connection
-// attempt as a failure. A real device's firmware does something
-// equivalent: it's what makes the limiter's slowdown effective instead
-// of just relocating the storm to the reconnect loop.
-func dialWithBackoff(ctx context.Context, url string, dialErrors, dialRejected *int64) (*websocket.Conn, bool) {
+// (expected during a storm) with jittered exponential backoff. A 401/403
+// (bad api key or unregistered device) is NOT retried, that's a
+// configuration problem this tool can't fix by trying again.
+func dialWithBackoff(ctx context.Context, url, apiKey, deviceID string, c *counters) (*websocket.Conn, bool) {
 	backoff := 200 * time.Millisecond
 	const maxBackoff = 5 * time.Second
+	opts := &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Authorization": []string{"Bearer " + apiKey},
+			"X-Device-ID":   []string{deviceID},
+		},
+	}
 	for {
-		conn, resp, err := websocket.Dial(ctx, url, nil)
+		conn, resp, err := websocket.Dial(ctx, url, opts)
 		if err == nil {
 			return conn, true
 		}
 		if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
-			atomic.AddInt64(dialRejected, 1)
+			c.dialRejected.Add(1)
 		} else {
-			atomic.AddInt64(dialErrors, 1)
+			c.dialErrors.Add(1)
 			return nil, false
 		}
 		select {
@@ -147,10 +159,7 @@ func dialWithBackoff(ctx context.Context, url string, dialErrors, dialRejected *
 	}
 }
 
-func runSegment(
-	ctx context.Context, conn *websocket.Conn, id int, interval, segment time.Duration,
-	sent, sendErrors *int64,
-) {
+func runSegment(ctx context.Context, conn *websocket.Conn, interval, segment time.Duration, c *counters) {
 	defer conn.CloseNow()
 
 	lat := 6.5244 + rand.Float64()*0.1
@@ -172,11 +181,8 @@ func runSegment(
 		lon += (rand.Float64() - 0.5) * 0.001
 
 		ping := PositionPing{
-			VehicleID:  fmt.Sprintf("sim-%d", id),
-			Lat:        lat,
-			Lon:        lon,
-			SpeedKPH:   rand.Float64() * 80,
-			HeadingDeg: rand.Float64() * 360,
+			Lat: lat, Lon: lon,
+			SpeedKPH: rand.Float64() * 80, HeadingDeg: rand.Float64() * 360,
 			RecordedAt: time.Now(),
 		}
 
@@ -184,9 +190,9 @@ func runSegment(
 		err := wsjson.Write(writeCtx, conn, ping)
 		cancel()
 		if err != nil {
-			atomic.AddInt64(sendErrors, 1)
+			c.sendErrors.Add(1)
 			return
 		}
-		atomic.AddInt64(sent, 1)
+		c.sent.Add(1)
 	}
 }

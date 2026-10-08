@@ -29,7 +29,6 @@ import (
 )
 
 type PositionPing struct {
-	VehicleID  string    `json:"vehicle_id"`
 	Lat        float64   `json:"lat"`
 	Lon        float64   `json:"lon"`
 	RecordedAt time.Time `json:"recorded_at"`
@@ -49,6 +48,7 @@ const testGeofenceID = "00000000-0000-0000-0000-000000000101"
 func main() {
 	wsURL := flag.String("ws-url", "ws://localhost:8080/ws/ingest", "public ingest ws endpoint")
 	adminURL := flag.String("admin-url", "http://localhost:9090", "internal admin http base url (metrics/debug)")
+	apiKey := flag.String("api-key", "dev-local-only-key", "tenant API key (matches migrations/seed_dev.sql's dev key by default)")
 	vehicleID := flag.String("vehicle", "route-test-1", "vehicle id for this run")
 	steps := flag.Int("steps", 25, "number of points along the route")
 	stepDelay := flag.Duration("step-delay", 300*time.Millisecond, "delay between points")
@@ -57,9 +57,14 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	conn, _, err := websocket.Dial(ctx, *wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, *wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Authorization": []string{"Bearer " + *apiKey},
+			"X-Device-ID":   []string{*vehicleID},
+		},
+	})
 	if err != nil {
-		log.Fatalf("dial: %v", err)
+		log.Fatalf("dial (check -api-key and that %s is registered or auto-register is on for the dev tenant): %v", *vehicleID, err)
 	}
 	defer conn.CloseNow()
 
@@ -79,7 +84,7 @@ func main() {
 		now := time.Now()
 		lastRecordedAt = now
 
-		ping := PositionPing{VehicleID: *vehicleID, Lat: lat, Lon: lng, RecordedAt: now}
+		ping := PositionPing{Lat: lat, Lon: lng, RecordedAt: now}
 		if err := wsjson.Write(ctx, conn, ping); err != nil {
 			log.Fatalf("write ping %d: %v", i, err)
 		}
@@ -92,14 +97,13 @@ func main() {
 	crossingPass := enters == 1 && exits == 1
 	printResult("crossing test", crossingPass)
 
-	// === stale-ping test ===
+	// === stale-ping test (Phase 3) ===
 	// Send one ping with an old timestamp (well before every ping just
 	// sent) and a position INSIDE the geofence, the position most likely
 	// to expose a bug, since a naive implementation would see "not
 	// currently in the inside-set" and wrongly fire a second "enter".
 	fmt.Println("\n=== stale-ping test ===")
 	stalePing := PositionPing{
-		VehicleID:  *vehicleID,
 		Lat:        lat,
 		Lon:        3.400, // inside the box
 		RecordedAt: lastRecordedAt.Add(-30 * time.Second),
