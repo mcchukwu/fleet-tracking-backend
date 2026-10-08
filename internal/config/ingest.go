@@ -1,9 +1,3 @@
-// Package config centralizes environment-driven configuration and
-// validates it at startup. The bug this fixes: previously, an invalid
-// OVERFLOW_POLICY value silently fell through to "drop_newest" inside
-// the ingestion hot path, with no warning anywhere. A typo in an env var
-// should fail loudly at process start, not silently change production
-// behavior three layers deep.
 package config
 
 import (
@@ -11,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 type Ingest struct {
@@ -26,18 +22,48 @@ type Ingest struct {
 	ColdPathBatchSize   int
 }
 
+func loadEnv() error {
+	if err := godotenv.Load(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func LoadIngest() (Ingest, error) {
+	loadEnv()
+
+	idleTimeout, err := getenvDuration("IDLE_TIMEOUT", 90*time.Second)
+	if err != nil {
+		return Ingest{}, err
+	}
+	acceptRate, err := getenvFloat("ACCEPT_RATE", 500)
+	if err != nil {
+		return Ingest{}, err
+	}
+	acceptBurst, err := getenvFloat("ACCEPT_BURST", 200)
+	if err != nil {
+		return Ingest{}, err
+	}
+	batchWindow, err := getenvDuration("COLDPATH_BATCH_WINDOW", time.Second)
+	if err != nil {
+		return Ingest{}, err
+	}
+	batchSize, err := getenvInt("COLDPATH_BATCH_SIZE", 500)
+	if err != nil {
+		return Ingest{}, err
+	}
 	c := Ingest{
-		RedisAddr:           getenv("REDIS_ADDR", "localhost:6379"),
-		ListenAddr:          getenv("LISTEN_ADDR", ":8080"),
-		AdminAddr:           getenv("ADMIN_ADDR", ":9090"),
-		PGDSN:               getenv("PG_DSN", "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"),
-		OverflowPolicy:      getenv("OVERFLOW_POLICY", "drop_oldest"),
-		IdleTimeout:         getenvDuration("IDLE_TIMEOUT", 90*time.Second),
-		AcceptRate:          getenvFloat("ACCEPT_RATE", 500),
-		AcceptBurst:         getenvFloat("ACCEPT_BURST", 200),
-		ColdPathBatchWindow: getenvDuration("COLDPATH_BATCH_WINDOW", 1*time.Second),
-		ColdPathBatchSize:   getenvInt("COLDPATH_BATCH_SIZE", 500),
+		RedisAddr:           getenv("REDIS_ADDR", ""),
+		ListenAddr:          getenv("LISTEN_ADDR", ""),
+		AdminAddr:           getenv("ADMIN_ADDR", ""),
+		PGDSN:               getenv("PG_DSN", ""),
+		OverflowPolicy:      getenv("OVERFLOW_POLICY", ""),
+		IdleTimeout:         idleTimeout,
+		AcceptRate:          acceptRate,
+		AcceptBurst:         acceptBurst,
+		ColdPathBatchWindow: batchWindow,
+		ColdPathBatchSize:   batchSize,
 	}
 	if err := c.Validate(); err != nil {
 		return Ingest{}, err
@@ -76,29 +102,35 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvDuration(key string, fallback time.Duration) time.Duration {
+func getenvDuration(key string, fallback time.Duration) (time.Duration, error) {
 	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
+		return d, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
-func getenvFloat(key string, fallback float64) float64 {
+func getenvFloat(key string, fallback float64) (float64, error) {
 	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
+		return f, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
-func getenvInt(key string, fallback int) int {
+func getenvInt(key string, fallback int) (int, error) {
 	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
+		return n, nil
 	}
-	return fallback
+	return fallback, nil
 }

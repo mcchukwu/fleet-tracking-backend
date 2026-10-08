@@ -1,9 +1,7 @@
-// Package coldpath is the durable, asynchronous write path. Every
-// processed ping and every geofence event gets batched and written to
-// Postgres here. Nothing in this package ever runs synchronously with
-// ingestion. pipeline.Pipeline only ever enqueues (a non-blocking channel
-// send) and moves on; a full cold-path queue degrades by dropping the
-// oldest durability writes, never by slowing down live ingestion.
+// Package coldpath batches asynchronous Postgres writes. It keeps database
+// latency off the ingest path, but its bounded queues can drop records when
+// full; callers must expose those counters and must not treat it as durable
+// delivery through an outage.
 package coldpath
 
 import (
