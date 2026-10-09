@@ -10,4 +10,8 @@ logs
 *.log
 
 # Go
-bin
+/bin/
+
+# Others
+captures/
+*.bin
