@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgis/postgis:18-3.6
+
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+
+    ports:
+      - "127.0.0.1:${DB_PORT}:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER} -d ${DB_NAME}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.10.1-alpine
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    ports:
+      - "127.0.0.1:${REDIS_PORT}:6379"
+
+    volumes:
+      - redis_data:/data
+
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
