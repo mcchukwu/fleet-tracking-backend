@@ -1,6 +1,6 @@
 BIN_PATH := bin
 
-.PHONY: run build clean test vet integration
+.PHONY: run build clean test vet migrate seed bootstrap dev integration
 
 run:
 	go run ./cmd/ingest
@@ -19,6 +19,19 @@ test:
 
 vet:
 	go vet ./...
+
+migrate:
+	go run ./cmd/migrate
+
+seed:
+	set -a; . ./.env; set +a; \
+	docker compose exec -T postgres psql -U "$$DB_USER" -d "$$DB_NAME" -v ON_ERROR_STOP=1 < scripts/seed_dev.sql
+
+bootstrap:
+	docker compose up -d --wait
+	$(MAKE) migrate
+
+dev: bootstrap seed
 
 integration:
 	./scripts/integration.sh

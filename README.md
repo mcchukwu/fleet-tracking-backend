@@ -10,19 +10,11 @@ Needs Go 1.26+ and Docker.
 
 ```bash
 cp .env.example .env
-docker compose up -d --wait
-go run ./cmd/migrate
-psql "$PG_DSN" -f scripts/seed_dev.sql   # dev tenant, key and one geofence
-go run ./cmd/ingest
+make dev        # postgres, redis, migrations, dev seed
+make run
 ```
 
-If `psql` is not installed, seed through the container:
-
-```bash
-docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" < scripts/seed_dev.sql
-```
-
-`go run ./cmd/migrate` is idempotent. The seed is not part of the migration chain; a production database gets no tenant, no key and no geofence until you create them.
+`make migrate` is idempotent. `make seed` loads the dev tenant, one API key and one geofence. The seed is not part of the migration chain; a production database gets none of it until you create them.
 
 Smoke test in another terminal:
 
