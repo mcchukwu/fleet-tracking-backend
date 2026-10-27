@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:18-3.6
+        env:
+          POSTGRES_DB: ftdb
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+
+      - name: integration
+        env:
+          DB_NAME: ftdb
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_SSLMODE: disable
+          REDIS_ADDR: localhost:6379
+          REDIS_PASSWORD: ""
+          LISTEN_ADDR: ":8080"
+          ADMIN_ADDR: "127.0.0.1:9090"
+          OVERFLOW_POLICY: drop_oldest
+          IDLE_TIMEOUT: 90s
+          ACCEPT_RATE: "500"
+          ACCEPT_BURST: "200"
+          PER_IP_RATE: "10"
+          PER_IP_BURST: "20"
+          COLDPATH_BATCH_WINDOW: 1s
+          COLDPATH_BATCH_SIZE: "500"
+          PG_DSN: postgres://postgres:postgres@localhost:5432/ftdb?sslmode=disable
+          SKIP_COMPOSE: "1"
+        run: |
+          cat > .env <<'ENV'
+          DB_NAME=ftdb
+          DB_USER=postgres
+          DB_PASSWORD=postgres
+          DB_HOST=localhost
+          DB_PORT=5432
+          DB_SSLMODE=disable
+          REDIS_ADDR=localhost:6379
+          REDIS_PASSWORD=
+          LISTEN_ADDR=:8080
+          ADMIN_ADDR=127.0.0.1:9090
+          OVERFLOW_POLICY=drop_oldest
+          IDLE_TIMEOUT=90s
+          ACCEPT_RATE=500
+          ACCEPT_BURST=200
+          PER_IP_RATE=10
+          PER_IP_BURST=20
+          COLDPATH_BATCH_WINDOW=1s
+          COLDPATH_BATCH_SIZE=500
+          PG_DSN=postgres://postgres:postgres@localhost:5432/ftdb?sslmode=disable
+          ENV
+          ./scripts/integration.sh
