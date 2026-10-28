@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ! -f .env ]]; then
-  echo "missing .env; copy .env.example and set local credentials first" >&2
+env_file="${ENV_FILE:-.env}"
+if [[ ! -f "$env_file" ]]; then
+  echo "missing $env_file; copy .env.example and set local credentials first" >&2
   exit 1
 fi
 set -a
-source .env
+source "$env_file"
 set +a
 
 if [[ "${SKIP_COMPOSE:-0}" != "1" ]]; then
@@ -56,6 +57,18 @@ if ! curl --fail --silent http://localhost:9090/readyz >/dev/null; then
   exit 1
 fi
 
+for _ in {1..30}; do
+  if curl --fail --silent http://localhost:9091/readyz >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+if ! curl --fail --silent http://localhost:9091/readyz >/dev/null; then
+  cat "$api_log" >&2
+  exit 1
+fi
+
 go run ./cmd/routetest -vehicle "$vehicle_id"
 sleep 2
 
@@ -74,4 +87,36 @@ if [[ "$positions" -lt 1 || "$events" -ne 2 ]]; then
   exit 1
 fi
 
-echo "PASS — integration: positions=$positions events=$events"
+jar="$(mktemp /tmp/fleet-tracking-api.XXXXXX.jar)"
+login="$(curl --silent --cookie-jar "$jar" -X POST http://localhost:9091/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dispatcher@demo.ftb","password":"DemoPass123!"}')"
+csrf="$(printf '%s' "$login" | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])')"
+vehicles="$(curl --silent --cookie "$jar" 'http://localhost:9091/api/v1/vehicles?limit=500' | \
+  python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"]))')"
+if [[ "$vehicles" -lt 20 ]]; then
+  echo "api check failed: vehicles=$vehicles" >&2
+  exit 1
+fi
+
+csv="$(mktemp /tmp/fleet-tracking-import.XXXXXX.csv)"
+printf 'imei,plate,vehicle_type,driver_name,driver_phone\n' > "$csv"
+printf 'integration-imei-1,INT-001-AA,truck,Integration Driver,08130000001\n' >> "$csv"
+printf 'integration-imei-2,INT-002-AA,truck,Integration Driver,08130000001\n' >> "$csv"
+imported="$(curl --silent --cookie "$jar" -X POST http://localhost:9091/api/v1/import/vehicles \
+  -H "X-CSRF-Token: $csrf" -F "file=@$csv" | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["imported"])')"
+rm -f "$csv"
+if [[ "$imported" -ne 2 ]]; then
+  echo "api import check failed: imported=$imported" >&2
+  exit 1
+fi
+
+sleep 2
+ws="$(go run ./cmd/wsprobe -api-url http://localhost:9091 2>&1)"
+if [[ "$ws" != ok* ]]; then
+  echo "websocket check failed: $ws" >&2
+  exit 1
+fi
+
+echo "PASS. integration: positions=$positions events=$events api_vehicles=$vehicles imported=$imported ws=$ws"
