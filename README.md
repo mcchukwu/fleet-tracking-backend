@@ -10,16 +10,35 @@ Needs Go 1.26+ and Docker.
 
 ```bash
 cp .env.example .env
-make dev        # postgres, redis, migrations, dev seed
-make run
+make dev        # postgres, redis, migrations, device seed, console seed
 ```
 
-`make migrate` is idempotent. `make seed` loads the dev tenant, one API key and one geofence. The seed is not part of the migration chain; a production database gets none of it until you create them.
+Then, in separate terminals:
 
-Smoke test in another terminal:
+```bash
+make run        # device ingest on :8080
+make api        # console API on :8081
+make simulator  # 20 trucks moving on the demo route
+```
+
+Console logins (all use `DemoPass123!`):
+
+| User | Role |
+|---|---|
+| `admin@demo.ftb` | admin |
+| `dispatcher@demo.ftb` | dispatcher |
+| `security@demo.ftb` | security |
+| `viewer@demo.ftb` | viewer |
+
+The device key for the demo tenant is `demo-device-key`. `make migrate` is idempotent. Seeds are not part of the migration chain; a production database starts empty.
+
+Smoke test:
 
 ```bash
 go run ./cmd/routetest -vehicle "route-test-$(date +%s)"
+curl -s -c /tmp/ftb.jar -X POST localhost:8081/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dispatcher@demo.ftb","password":"DemoPass123!"}'
 ```
 
 The database schema changed in the 000003 migration. If you ran an older checkout, drop the dev volume and start again.
@@ -40,6 +59,24 @@ Each frame is JSON:
 ```
 
 There is no vehicle id in the body. A ping belongs to the identity authenticated at the handshake. A connection that sends nothing for `IDLE_TIMEOUT` is closed.
+
+## Console API
+
+The API is a separate binary (`cmd/api`) on `API_ADDR`. It reads Redis for live state and Postgres for everything else. Authentication is a session cookie; mutating requests need `X-CSRF-Token`, returned by login and `/me`.
+
+| Area | Routes |
+|---|---|
+| Auth | `POST /api/v1/auth/login`, `/logout`, `GET /me` |
+| Vehicles | `GET /vehicles`, `GET /vehicles/{id}`, `GET /vehicles/{id}/history` |
+| Live | `GET /live/snapshot`, `GET /live/ws` |
+| Trips | `GET/POST /trips`, `PATCH /trips/{id}` |
+| Alerts | `GET /alerts`, `POST /alerts/{id}/ack`, `GET/PATCH /alert-rules` |
+| Geofences | `GET/POST /geofences`, `PATCH/DELETE /geofences/{id}` |
+| Reports | `GET /reports/summary` |
+| Import | `POST /import/vehicles` (CSV, 20 MB) |
+| System | `GET /system/health` |
+
+The OpenAPI description is in [openapi.yaml](openapi.yaml). Roles: `admin` and `dispatcher` can mutate; `security` can acknowledge alerts; `viewer` is read-only. Every query is scoped to the logged-in user's tenant.
 
 ## Endpoints
 
@@ -95,7 +132,7 @@ TEST_REDIS_ADDR=localhost:6379 TEST_REDIS_PASSWORD=devredis go test ./internal/p
 ./scripts/integration.sh
 ```
 
-`scripts/integration.sh` starts the containers, migrates, seeds, runs a route through the service and checks that the positions and geofence events landed in Postgres. Set `SKIP_COMPOSE=1` when the services already exist. CI runs it against PostGIS and Redis services.
+`scripts/integration.sh` starts the containers, migrates, seeds, runs a route through ingest, checks that positions and geofence events landed, then logs into the API, lists vehicles and imports a small CSV. Set `SKIP_COMPOSE=1` when the services already exist. CI runs it against PostGIS and Redis services.
 
 ## Limits
 

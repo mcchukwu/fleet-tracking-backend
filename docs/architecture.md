@@ -57,6 +57,14 @@ Tenant and vehicle UUID are fields on `PositionPing`. Geofence lookup, Redis key
 
 History and event rows carry `tenant_id` and composite foreign keys to `vehicles (tenant_id, id)` and `geofences (tenant_id, id)`, so the database rejects a cross-tenant pair even if application code is wrong.
 
+## Console API
+
+`cmd/api` is a separate process. It reads Redis for live state and Postgres for vehicles, trips, alerts, geofences and history. The browser holds a session cookie; mutating requests need a double-submit CSRF header. Every query is scoped to the user's tenant.
+
+Ingest publishes each live update to the Redis channel `ftb:live`; the API subscribes and filters by the user's tenant before writing to `/api/v1/live/ws`. Geofence writes bump `ftb:geofence_version`; ingest polls that key and reloads its in-memory cache, so a geofence change does not need a restart.
+
+The alert worker runs in ingest every 15 seconds against active trips: device offline, speeding, route deviation and idle. Geofence enter/exit alerts come from the pipeline itself. Alert rows are deduplicated by a partial unique index on open alerts per vehicle and type.
+
 ## Failure behaviour
 
 | Failure | What happens |

@@ -25,6 +25,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/auth"
+	"github.com/mcchukwu/fleet-tracking-backend/internal/bus"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/coldpath"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/config"
 	"github.com/mcchukwu/fleet-tracking-backend/internal/db"
@@ -113,11 +114,14 @@ func main() {
 	hubCtx, hubCancel := context.WithCancel(context.Background())
 	defer hubCancel()
 	go liveHub.Run(hubCtx)
-	pl.SetBroadcaster(liveHub)
+	pl.SetBroadcaster(fanout{liveHub, bus.NewPublisher(rdb)})
 
 	pl.Start()
 
 	log.Info("geofences loaded", "names", geoCache.AllPolygonNames())
+	go publishMetrics(rdb, pl, coldWriter)
+	go reloadGeofences(rdb, pg, geoCache, log)
+	go runAlertRules(rdb, pg, log)
 	log.Info("config",
 		"overflow_policy", cfg.OverflowPolicy, "idle_timeout", cfg.IdleTimeout,
 		"accept_rate", cfg.AcceptRate, "accept_burst", cfg.AcceptBurst,
@@ -407,5 +411,60 @@ func readyHandler(pg *sql.DB, rdb *redis.Client) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// fanout sends pipeline output to the local admin feed and the API process.
+type fanout []pipeline.Broadcaster
+
+func (f fanout) Publish(v any) {
+	for _, b := range f {
+		b.Publish(v)
+	}
+}
+
+func publishMetrics(rdb *redis.Client, pl *pipeline.Pipeline, cw *coldpath.Writer) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		positions, alerts := cw.QueueLen()
+		payload, err := json.Marshal(map[string]any{
+			"received": pl.Received(), "dropped": pl.Dropped(), "stale": pl.Stale(),
+			"redis_errors": pl.RedisErrors(), "validation_errors": pl.ValidationErrors(),
+			"queue_length": pl.QueueLen(), "queue_capacity": pl.QueueCap(),
+			"coldpath_queue_positions": positions, "coldpath_queue_alerts": alerts,
+			"coldpath_failed_positions": cw.FailedPositions(), "coldpath_failed_alerts": cw.FailedAlerts(),
+		})
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = rdb.Set(ctx, "ftb:metrics:ingest", payload, 30*time.Second).Err()
+			cancel()
+		}
+	}
+}
+
+func reloadGeofences(rdb *redis.Client, pg *sql.DB, cache *geofence.Cache, log *slog.Logger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	last := ""
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		version, err := rdb.Get(ctx, "ftb:geofence_version").Result()
+		if err != nil && err != redis.Nil {
+			cancel()
+			continue
+		}
+		if version == last {
+			cancel()
+			continue
+		}
+		if err := cache.Reload(ctx, pg); err != nil {
+			log.Error("geofence reload failed", "error", err)
+			cancel()
+			continue
+		}
+		last = version
+		cancel()
+		log.Info("geofences reloaded", "version", version)
 	}
 }

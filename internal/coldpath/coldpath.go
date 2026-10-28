@@ -5,6 +5,7 @@ package coldpath
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -189,6 +190,7 @@ func (w *Writer) flushAlerts(batch []AlertRecord) {
 
 	err := w.insertAlerts(ctx, batch)
 	if err == nil {
+		w.insertAlertRows(ctx, batch)
 		return
 	}
 	w.log.Error("coldpath: alert batch failed, retrying per row", "count", len(batch), "error", err)
@@ -199,6 +201,8 @@ func (w *Writer) flushAlerts(batch []AlertRecord) {
 			w.failedAlerts.Add(1)
 			w.log.Error("coldpath: alert write failed",
 				"tenant", r.TenantID, "vehicle", r.VehicleExternalID, "error", err)
+		} else {
+			w.insertAlertRows(rowCtx, []AlertRecord{r})
 		}
 		rowCancel()
 	}
@@ -217,4 +221,24 @@ func (w *Writer) insertAlerts(ctx context.Context, batch []AlertRecord) error {
 		strings.Join(values, ",") + " ON CONFLICT DO NOTHING"
 	_, err := w.db.ExecContext(ctx, query, args...)
 	return err
+}
+
+func (w *Writer) insertAlertRows(ctx context.Context, batch []AlertRecord) {
+	for _, r := range batch {
+		kind := "geofence_enter"
+		severity := "medium"
+		if r.EventType == "exit" {
+			kind = "geofence_exit"
+			severity = "high"
+		}
+		evidence, _ := json.Marshal(map[string]string{"geofence_id": r.GeofenceID})
+		_, err := w.db.ExecContext(ctx, `
+			INSERT INTO alerts (tenant_id, vehicle_id, type, severity, occurred_at, evidence)
+			VALUES ($1, $2, $3::alert_type, $4::alert_severity, $5, $6::jsonb)
+			ON CONFLICT DO NOTHING
+		`, r.TenantID, r.VehicleUUID, kind, severity, r.EventTime, string(evidence))
+		if err != nil {
+			w.log.Error("coldpath: alert insert failed", "tenant", r.TenantID, "vehicle", r.VehicleExternalID, "error", err)
+		}
+	}
 }

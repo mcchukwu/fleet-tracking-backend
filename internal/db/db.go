@@ -33,6 +33,8 @@ func RequireSchema(ctx context.Context, db *sql.DB) error {
 	var ok bool
 	err := db.QueryRowContext(ctx, `
 		SELECT to_regclass('public.api_keys') IS NOT NULL
+		   AND to_regclass('public.users') IS NOT NULL
+		   AND to_regclass('public.alert_rules') IS NOT NULL
 		   AND EXISTS (
 			   SELECT 1 FROM information_schema.columns
 			   WHERE table_name = 'position_history' AND column_name = 'tenant_id'

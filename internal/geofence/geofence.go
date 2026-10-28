@@ -87,6 +87,16 @@ func (c *Cache) AllPolygonNames() []string {
 	return names
 }
 
+// Reload rebuilds the cache in place after a geofence change.
+func (c *Cache) Reload(ctx context.Context, db *sql.DB) error {
+	fresh, err := LoadFromPostgres(ctx, db)
+	if err != nil {
+		return err
+	}
+	c.replace(fresh.byTenant)
+	return nil
+}
+
 func (c *Cache) replace(byTenant map[string][]Polygon) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

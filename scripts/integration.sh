@@ -18,6 +18,7 @@ if command -v psql >/dev/null; then
 else
   docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 < scripts/seed_dev.sql
 fi
+go run ./cmd/seed
 
 TEST_REDIS_ADDR="$REDIS_ADDR" TEST_REDIS_PASSWORD="$REDIS_PASSWORD" go test -run '^TestApplyPositionAtomicallyTracksTransitions$' ./internal/pipeline
 
@@ -26,10 +27,15 @@ server_log="$(mktemp /tmp/fleet-tracking-ingest.XXXXXX.log)"
 go run ./cmd/ingest >"$server_log" 2>&1 &
 server_pid=$!
 
+api_log="$(mktemp /tmp/fleet-tracking-api.XXXXXX.log)"
+API_ADDR=127.0.0.1:9091 COOKIE_SECURE=false go run ./cmd/api >"$api_log" 2>&1 &
+api_pid=$!
+
 cleanup() {
-  kill "$server_pid" 2>/dev/null || true
+  kill "$api_pid" "$server_pid" 2>/dev/null || true
+  wait "$api_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
-  rm -f "$server_log"
+  rm -f "$server_log" "$api_log"
 }
 trap cleanup EXIT
 

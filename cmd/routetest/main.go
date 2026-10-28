@@ -201,9 +201,6 @@ func fetchVehicleState(adminURL, tenantID, vehicleID string) (map[string]string,
 // test tool distinguishing "3.42-ish" from "3.400", not a general
 // float-comparison utility.
 func closeEnough(a, b string) bool {
-	n := len(b)
-	if len(a) < n {
-		n = len(a)
-	}
+	n := min(len(a), len(b))
 	return a[:n] == b[:n]
 }

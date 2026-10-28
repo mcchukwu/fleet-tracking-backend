@@ -1,0 +1,548 @@
+openapi: 3.1.0
+info:
+  title: Fleet Tracking API
+  version: 0.1.0
+  description: |
+    Console API for the fleet-tracking-backend. Session cookie authentication,
+    tenant scoping from the logged-in user, GeoJSON geometry.
+servers:
+  - url: /api/v1
+security:
+  - cookieAuth: []
+paths:
+  /auth/login:
+    post:
+      security: []
+      summary: Sign in
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Session cookie and CSRF token.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  csrf_token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/logout:
+    post:
+      summary: Sign out
+      parameters:
+        - $ref: '#/components/parameters/CSRF'
+      responses:
+        '204': { description: Session revoked }
+  /me:
+    get:
+      summary: Current user and CSRF token
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  csrf_token: { type: string }
+  /vehicles:
+    get:
+      summary: List vehicles with their last position
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+        - name: q
+          in: query
+          description: Plate or IMEI fragment
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Vehicles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Vehicle' }
+  /vehicles/{id}:
+    get:
+      summary: One vehicle
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Vehicle
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Vehicle' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /vehicles/{id}/history:
+    get:
+      summary: Position history
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: resolution
+          in: query
+          schema: { type: string, enum: [raw, 30s, 5m] }
+      responses:
+        '200':
+          description: Points
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Point' }
+                  resolution: { type: string }
+  /live/snapshot:
+    get:
+      summary: Current state for every vehicle in the tenant
+      responses:
+        '200':
+          description: Vehicles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Vehicle' }
+  /live/ws:
+    get:
+      summary: Live WebSocket feed
+      description: Session cookie required. Messages are position or alert updates for the user's tenant.
+      responses:
+        '101': { description: Switching protocols }
+  /geofences:
+    get:
+      summary: List geofences
+      responses:
+        '200':
+          description: Geofences
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Geofence' }
+    post:
+      summary: Create a geofence
+      parameters:
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GeofenceInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /geofences/{id}:
+    patch:
+      summary: Update a geofence
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GeofenceInput' }
+      responses:
+        '204': { description: Updated }
+    delete:
+      summary: Delete a geofence
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      responses:
+        '204': { description: Deleted }
+        '409': { description: Geofence has events }
+  /trips:
+    get:
+      summary: List trips
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Trips
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Trip' }
+    post:
+      summary: Create a trip
+      parameters:
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TripInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+  /trips/{id}:
+    patch:
+      summary: Update trip status or driver
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TripUpdate' }
+      responses:
+        '204': { description: Updated }
+  /alerts:
+    get:
+      summary: List alerts
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [open, acked, closed] }
+        - name: type
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Alert' }
+  /alerts/{id}/ack:
+    post:
+      summary: Acknowledge an alert
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      responses:
+        '204': { description: Acknowledged }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /alert-rules:
+    get:
+      summary: List alert rules
+      responses:
+        '200':
+          description: Rules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AlertRule' }
+  /alert-rules/{id}:
+    patch:
+      summary: Enable or configure a rule
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                config: { type: object }
+      responses:
+        '204': { description: Updated }
+  /reports/summary:
+    get:
+      summary: Fleet summary
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vehicles: { type: integer }
+                  trips: { type: integer }
+                  completed_trips: { type: integer }
+                  active_trips: { type: integer }
+                  alerts: { type: integer }
+                  open_alerts: { type: integer }
+                  alerts_by_type:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key: { type: string }
+                        count: { type: integer }
+  /system/health:
+    get:
+      summary: Dependencies and ingest counters
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema: { type: object }
+  /import/vehicles:
+    post:
+      summary: Import vehicles from CSV
+      parameters:
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Import summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+                  total: { type: integer }
+                  imported: { type: integer }
+                  failed: { type: integer }
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        row: { type: integer }
+                        message: { type: string }
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: ftb_session
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CSRF:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 100, maximum: 500 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0 }
+  responses:
+    Unauthorized:
+      description: Not signed in
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many attempts
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        email: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [admin, dispatcher, security, viewer] }
+    Vehicle:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        external_id: { type: string }
+        plate: { type: string }
+        vehicle_type: { type: string }
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer }
+        colour: { type: string }
+        status: { type: string }
+        depot: { type: string }
+        department: { type: string }
+        driver_id: { type: string, format: uuid }
+        driver_name: { type: string }
+        driver_phone: { type: string }
+        trip_id: { type: string, format: uuid }
+        destination: { type: string }
+        trip_status: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        speed_kph: { type: number }
+        heading_deg: { type: number }
+        recorded_at: { type: string, format: date-time }
+        online: { type: boolean }
+    Point:
+      type: object
+      properties:
+        t: { type: string, format: date-time }
+        lat: { type: number }
+        lon: { type: number }
+        speed_kph: { type: number }
+        heading_deg: { type: number }
+    Trip:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        vehicle_id: { type: string, format: uuid }
+        plate: { type: string }
+        driver_id: { type: string, format: uuid }
+        driver_name: { type: string }
+        origin: { type: string }
+        destination: { type: string }
+        status: { type: string, enum: [planned, assigned, active, completed, cancelled] }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+    TripInput:
+      type: object
+      required: [vehicle_id, origin, destination]
+      properties:
+        vehicle_id: { type: string, format: uuid }
+        driver_id: { type: string, format: uuid }
+        origin: { type: string }
+        destination: { type: string }
+        status: { type: string }
+    TripUpdate:
+      type: object
+      properties:
+        status: { type: string }
+        driver_id: { type: string, format: uuid }
+    Alert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        vehicle_id: { type: string, format: uuid }
+        plate: { type: string }
+        trip_id: { type: string, format: uuid }
+        type: { type: string }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        status: { type: string, enum: [open, acked, closed] }
+        occurred_at: { type: string, format: date-time }
+        acked_at: { type: string, format: date-time }
+        evidence: { type: object }
+    AlertRule:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        enabled: { type: boolean }
+        config: { type: object }
+    Geofence:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        geometry: { $ref: '#/components/schemas/Polygon' }
+    GeofenceInput:
+      type: object
+      required: [name, geometry]
+      properties:
+        name: { type: string }
+        geometry: { $ref: '#/components/schemas/Polygon' }
+    Polygon:
+      type: object
+      properties:
+        type: { type: string, enum: [Polygon] }
+        coordinates:
+          type: array
+          items:
+            type: array
+            items:
+              type: array
+              items: { type: number }

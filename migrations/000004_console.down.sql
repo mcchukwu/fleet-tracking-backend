@@ -1,0 +1,36 @@
+DROP INDEX IF EXISTS idx_position_history_recorded_brin;
+DROP INDEX IF EXISTS idx_position_history_tenant_time;
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS import_jobs;
+DROP TABLE IF EXISTS alert_rules;
+DROP TABLE IF EXISTS alerts;
+DROP TABLE IF EXISTS trip_stops;
+DROP TABLE IF EXISTS trips;
+DROP TABLE IF EXISTS assignments;
+DROP INDEX IF EXISTS vehicles_tenant_status;
+DROP INDEX IF EXISTS vehicles_tenant_plate;
+ALTER TABLE vehicles DROP CONSTRAINT IF EXISTS vehicles_current_driver_fk;
+ALTER TABLE vehicles
+    DROP COLUMN IF EXISTS plate,
+    DROP COLUMN IF EXISTS vehicle_type,
+    DROP COLUMN IF EXISTS make,
+    DROP COLUMN IF EXISTS model,
+    DROP COLUMN IF EXISTS year,
+    DROP COLUMN IF EXISTS colour,
+    DROP COLUMN IF EXISTS chassis_number,
+    DROP COLUMN IF EXISTS sim_number,
+    DROP COLUMN IF EXISTS device_model,
+    DROP COLUMN IF EXISTS protocol,
+    DROP COLUMN IF EXISTS depot,
+    DROP COLUMN IF EXISTS department,
+    DROP COLUMN IF EXISTS status,
+    DROP COLUMN IF EXISTS current_driver_id,
+    DROP COLUMN IF EXISTS last_seen_at;
+DROP TABLE IF EXISTS drivers;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
+DROP TYPE IF EXISTS alert_status;
+DROP TYPE IF EXISTS alert_severity;
+DROP TYPE IF EXISTS alert_type;
+DROP TYPE IF EXISTS trip_status;
+DROP TYPE IF EXISTS user_role;
