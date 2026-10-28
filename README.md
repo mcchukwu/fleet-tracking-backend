@@ -142,6 +142,12 @@ Data maintenance:
 make maintenance   # 60-day position retention, old sessions and import jobs
 ```
 
+Live feed probe, useful when the frontend WebSocket stops updating:
+
+```bash
+make wsprobe       # logs in, connects to /api/v1/live/ws, expects one frame
+```
+
 Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately.
 
 ## Limits
