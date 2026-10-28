@@ -29,6 +29,50 @@ func runAlertRules(rdb *redis.Client, pg *sql.DB, log *slog.Logger) {
 	}
 }
 
+type rule struct {
+	enabled  bool
+	speed    float64
+	duration float64
+	distance float64
+}
+
+func loadRules(ctx context.Context, pg *sql.DB, tenantID string) map[string]rule {
+	rules := map[string]rule{}
+	rows, err := pg.QueryContext(ctx, `
+		SELECT type::text, enabled, config FROM alert_rules WHERE tenant_id = $1
+	`, tenantID)
+	if err != nil {
+		return rules
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var enabled bool
+		var raw []byte
+		if rows.Scan(&kind, &enabled, &raw) != nil {
+			continue
+		}
+		var cfg map[string]float64
+		_ = json.Unmarshal(raw, &cfg)
+		r := rule{enabled: enabled, speed: cfg["speed_kph"], duration: cfg["duration_s"], distance: cfg["distance_m"]}
+		rules[kind] = r
+	}
+	return rules
+}
+
+func (r rule) or(defaults rule) rule {
+	if r.speed == 0 {
+		r.speed = defaults.speed
+	}
+	if r.duration == 0 {
+		r.duration = defaults.duration
+	}
+	if r.distance == 0 {
+		r.distance = defaults.distance
+	}
+	return r
+}
+
 func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog.Logger) {
 	rows, err := pg.QueryContext(ctx, `
 		SELECT t.id, t.tenant_id, t.vehicle_id, v.external_id, t.planned_route IS NOT NULL
@@ -49,8 +93,30 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 	}
 	rows.Close()
 
+	rulesByTenant := map[string]map[string]rule{}
 	now := time.Now()
 	for _, trip := range trips {
+		rules, ok := rulesByTenant[trip.tenantID]
+		if !ok {
+			rules = loadRules(ctx, pg, trip.tenantID)
+			rulesByTenant[trip.tenantID] = rules
+		}
+		offline := rule{enabled: true, duration: 600}
+		if r, ok := rules["device_offline"]; ok {
+			offline = r.or(offline)
+		}
+		speeding := rule{enabled: true, speed: 80}
+		if r, ok := rules["speeding"]; ok {
+			speeding = r.or(speeding)
+		}
+		deviation := rule{enabled: true, distance: 2000}
+		if r, ok := rules["route_deviation"]; ok {
+			deviation = r.or(deviation)
+		}
+		idle := rule{enabled: true, duration: 600, speed: 2}
+		if r, ok := rules["idle"]; ok {
+			idle = r.or(idle)
+		}
 		state, err := rdb.HGetAll(ctx, stateKey(trip.tenantID, trip.externalID)).Result()
 		if err != nil || len(state) == 0 {
 			continue
@@ -58,16 +124,16 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 		recorded, _ := time.Parse(time.RFC3339Nano, state["recorded_at"])
 		speed, _ := parseFloat(state["speed_kph"])
 
-		if !recorded.IsZero() && now.Sub(recorded) > 10*time.Minute {
+		if offline.enabled && !recorded.IsZero() && now.Sub(recorded) > time.Duration(offline.duration)*time.Second {
 			raiseAlert(ctx, pg, trip, "device_offline", "high", now, map[string]any{
 				"last_seen": recorded.UTC().Format(time.RFC3339),
 			})
 		}
-		if speed > 80 {
+		if speeding.enabled && speed > speeding.speed {
 			raiseAlert(ctx, pg, trip, "speeding", "medium", recorded, map[string]any{"speed_kph": speed})
 		}
 
-		if trip.hasRoute {
+		if trip.hasRoute && deviation.enabled {
 			var distance float64
 			err := pg.QueryRowContext(ctx, `
 				SELECT ST_Distance(p.location, t.planned_route)
@@ -76,7 +142,7 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 				WHERE p.vehicle_id = t.vehicle_id AND p.recorded_at > now() - interval '5 minutes'
 				ORDER BY p.recorded_at DESC LIMIT 1
 			`, trip.id).Scan(&distance)
-			if err == nil && distance > 2000 {
+			if err == nil && distance > deviation.distance {
 				raiseAlert(ctx, pg, trip, "route_deviation", "high", now, map[string]any{
 					"distance_m": distance,
 				})
@@ -91,7 +157,8 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 			FROM position_history
 			WHERE vehicle_id = $1 AND recorded_at > now() - interval '15 minutes'
 		`, trip.vehicleUUID).Scan(&count, &minTime, &maxTime, &maxSpeed)
-		if err == nil && count >= 3 && maxSpeed < 2 && now.Sub(minTime) > 10*time.Minute && now.Sub(maxTime) < 5*time.Minute {
+		if idle.enabled && err == nil && count >= 3 && maxSpeed < idle.speed &&
+			now.Sub(minTime) > time.Duration(idle.duration)*time.Second && now.Sub(maxTime) < 5*time.Minute {
 			raiseAlert(ctx, pg, trip, "idle", "medium", now, map[string]any{
 				"minutes": int(now.Sub(minTime).Minutes()),
 			})

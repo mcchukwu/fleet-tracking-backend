@@ -73,6 +73,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/reports/summary", s.auth(http.HandlerFunc(s.reportSummary)))
 	mux.Handle("POST /api/v1/import/vehicles", s.auth(s.role(http.HandlerFunc(s.importVehicles), identity.RoleAdmin, identity.RoleDispatcher)))
 	mux.Handle("GET /api/v1/live/ws", s.auth(http.HandlerFunc(s.liveWS)))
+	mux.Handle("GET /api/v1/drivers", s.auth(http.HandlerFunc(s.listDrivers)))
+	mux.Handle("GET /api/v1/audit", s.auth(s.role(http.HandlerFunc(s.listAudit), identity.RoleAdmin, identity.RoleSecurity)))
 
 	var handler http.Handler = mux
 	handler = s.recoverer(handler)

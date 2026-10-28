@@ -337,6 +337,32 @@ paths:
                       properties:
                         key: { type: string }
                         count: { type: integer }
+  /drivers:
+    get:
+      summary: List drivers
+      responses:
+        '200':
+          description: Drivers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Driver' }
+  /audit:
+    get:
+      summary: Recent user actions
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Audit entries
+          content:
+            application/json:
+              schema: { type: object }
   /system/health:
     get:
       summary: Dependencies and ingest counters
@@ -516,6 +542,15 @@ components:
         occurred_at: { type: string, format: date-time }
         acked_at: { type: string, format: date-time }
         evidence: { type: object }
+    Driver:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        phone: { type: string }
+        licence: { type: string }
+        status: { type: string }
+        vehicles: { type: integer }
     AlertRule:
       type: object
       properties:
