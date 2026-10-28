@@ -37,6 +37,10 @@ func RequireSchema(ctx context.Context, db *sql.DB) error {
 		   AND to_regclass('public.alert_rules') IS NOT NULL
 		   AND EXISTS (
 			   SELECT 1 FROM information_schema.columns
+			   WHERE table_name = 'trips' AND column_name = 'distance_km'
+		   )
+		   AND EXISTS (
+			   SELECT 1 FROM information_schema.columns
 			   WHERE table_name = 'position_history' AND column_name = 'tenant_id'
 		   )
 	`).Scan(&ok)

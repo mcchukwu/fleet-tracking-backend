@@ -74,6 +74,8 @@ The API is a separate binary (`cmd/api`) on `API_ADDR`. It reads Redis for live 
 | Geofences | `GET/POST /geofences`, `PATCH/DELETE /geofences/{id}` |
 | Reports | `GET /reports/summary` |
 | Import | `POST /import/vehicles` (CSV, 20 MB) |
+| Drivers | `GET /drivers` |
+| Audit | `GET /audit` (admin, security) |
 | System | `GET /system/health` |
 
 The OpenAPI description is in [openapi.yaml](openapi.yaml). Roles: `admin` and `dispatcher` can mutate; `security` can acknowledge alerts; `viewer` is read-only. Every query is scoped to the logged-in user's tenant.
@@ -132,7 +134,15 @@ TEST_REDIS_ADDR=localhost:6379 TEST_REDIS_PASSWORD=devredis go test ./internal/p
 ./scripts/integration.sh
 ```
 
-`scripts/integration.sh` starts the containers, migrates, seeds, runs a route through ingest, checks that positions and geofence events landed, then logs into the API, lists vehicles and imports a small CSV. Set `SKIP_COMPOSE=1` when the services already exist. CI runs it against PostGIS and Redis services.
+`scripts/integration.sh` starts the containers, migrates, seeds, runs a route through ingest, checks that positions and geofence events landed, logs into the API, lists vehicles, imports a small CSV and probes the live WebSocket. Set `SKIP_COMPOSE=1` when the services already exist. CI runs it against PostGIS and Redis services and builds the image.
+
+Data maintenance:
+
+```bash
+make maintenance   # 60-day position retention, old sessions and import jobs
+```
+
+Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately.
 
 ## Limits
 

@@ -282,7 +282,7 @@ func (s *Server) liveSnapshot(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listGeofences(w http.ResponseWriter, r *http.Request) {
 	user := userFrom(r.Context())
 	rows, err := s.db.QueryContext(r.Context(), `
-		SELECT id, name, ST_AsGeoJSON(boundary)
+		SELECT id, name, kind::text, ST_AsGeoJSON(boundary)
 		FROM geofences WHERE tenant_id = $1 ORDER BY name
 	`, user.TenantID)
 	if err != nil {
@@ -294,13 +294,14 @@ func (s *Server) listGeofences(w http.ResponseWriter, r *http.Request) {
 	type geofence struct {
 		ID       string          `json:"id"`
 		Name     string          `json:"name"`
+		Kind     string          `json:"kind"`
 		Geometry json.RawMessage `json:"geometry"`
 	}
 	out := []geofence{}
 	for rows.Next() {
 		var g geofence
 		var raw string
-		if err := rows.Scan(&g.ID, &g.Name, &raw); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &raw); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "could not read geofences")
 			return
 		}

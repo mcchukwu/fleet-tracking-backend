@@ -128,7 +128,7 @@ func seedFleet(ctx context.Context, tx *sql.Tx) error {
 	firstNames := []string{"Adebayo", "Chinedu", "Musa", "Tunde", "Emeka", "Sani", "Femi", "Ibrahim", "Kunle", "Uche"}
 	lastNames := []string{"Okafor", "Bello", "Adeyemi", "Musa", "Eze", "Yusuf", "Balogun", "Ali", "Ojo", "Nwosu"}
 	driverIDs := make([]string, 0, 20)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		var id string
 		err := tx.QueryRowContext(ctx, `
 			INSERT INTO drivers (tenant_id, name, phone, licence)
@@ -144,7 +144,7 @@ func seedFleet(ctx context.Context, tx *sql.Tx) error {
 		driverIDs = append(driverIDs, id)
 	}
 
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		plate := fmt.Sprintf("LSD-%03d-AA", 100+i)
 		externalID := fmt.Sprintf("demo-imei-%04d", i+1)
 		if _, err := tx.ExecContext(ctx, `
@@ -176,18 +176,18 @@ func seedFleet(ctx context.Context, tx *sql.Tx) error {
 
 func seedGeofences(ctx context.Context, tx *sql.Tx) error {
 	zones := []struct {
-		id, name, wkt string
+		id, name, kind, wkt string
 	}{
-		{"00000000-0000-0000-0000-000000000201", "Refinery Gate", "SRID=4326;POLYGON((3.380 6.440, 3.400 6.440, 3.400 6.455, 3.380 6.455, 3.380 6.440))"},
-		{"00000000-0000-0000-0000-000000000202", "Lekki Depot", "SRID=4326;POLYGON((3.470 6.430, 3.490 6.430, 3.490 6.445, 3.470 6.445, 3.470 6.430))"},
-		{"00000000-0000-0000-0000-000000000203", "Ibadan Customer", "SRID=4326;POLYGON((3.870 7.360, 3.900 7.360, 3.900 7.385, 3.870 7.385, 3.870 7.360))"},
+		{"00000000-0000-0000-0000-000000000201", "Refinery Gate", "restricted", "SRID=4326;POLYGON((3.380 6.440, 3.400 6.440, 3.400 6.455, 3.380 6.455, 3.380 6.440))"},
+		{"00000000-0000-0000-0000-000000000202", "Lekki Depot", "depot", "SRID=4326;POLYGON((3.470 6.430, 3.490 6.430, 3.490 6.445, 3.470 6.445, 3.470 6.430))"},
+		{"00000000-0000-0000-0000-000000000203", "Ibadan Customer", "customer", "SRID=4326;POLYGON((3.870 7.360, 3.900 7.360, 3.900 7.385, 3.870 7.385, 3.870 7.360))"},
 	}
 	for _, z := range zones {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO geofences (id, tenant_id, name, boundary)
-			VALUES ($1, $2, $3, ST_GeogFromText($4))
-			ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, boundary = EXCLUDED.boundary
-		`, z.id, demoTenantID, z.name, z.wkt); err != nil {
+			INSERT INTO geofences (id, tenant_id, name, boundary, kind)
+			VALUES ($1, $2, $3, ST_GeogFromText($4), $5::geofence_kind)
+			ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, boundary = EXCLUDED.boundary, kind = EXCLUDED.kind
+		`, z.id, demoTenantID, z.name, z.wkt, z.kind); err != nil {
 			return err
 		}
 	}

@@ -1,20 +1,7 @@
-// tcpsniff is a dev tool, not part of the production binary. It listens
-// on raw TCP (and optionally UDP) ports, accepts whatever a real device
-// sends, and records it byte-for-byte: a hex dump to the console and to a
-// per-connection log, plus the raw bytes to a per-connection .bin file.
-//
-// Why this exists: the CW230 tracker has no documented protocol (white
-// label hardware, no usable vendor docs), and the T98 dashcam's protocol
-// is only inferred from its platform compatibility claims. Writing a
-// parser against an assumed spec is guessing; writing it against bytes the
-// device actually sent is engineering. Capture first, then parse.
-//
-// What this tool is NOT: a protocol implementation. It does not
-// understand any frame, and it does not send a protocol-correct reply.
-// Many devices keep retrying their login frame until they get a valid
-// acknowledgement. that is fine here, since the first frames are what we
-// need, and a correct reply is something the real adapter will do once we
-// know the protocol.
+// tcpsniff is a dev tool that listens on raw TCP (and optionally UDP) ports,
+// accepts whatever a real device sends, and records it byte-for-byte:
+// a hex dump to the console and to a per-connection log,
+// plus the raw bytes to a per-connection .bin file.
 //
 // Safety: this accepts arbitrary bytes from whoever can reach the port.
 // Run it only while capturing, cap what it records (-max-bytes,

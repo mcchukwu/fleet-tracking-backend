@@ -6,11 +6,6 @@
 //     an old timestamp, and a position that would (wrongly) look like a
 //     second "enter" if the server applied it, checking that neither
 //     the hot-path position nor the alert log are affected by it.
-//
-// This is the correctness check the stochastic load generator can't
-// give you: with 5,000 randomly-drifting vehicles you can't predict who
-// crosses what, when, or engineer a precise out-of-order scenario. This
-// tool trades scale for a known-correct answer.
 package main
 
 import (

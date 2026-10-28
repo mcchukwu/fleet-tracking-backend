@@ -1,0 +1,3 @@
+ALTER TABLE trips DROP COLUMN IF EXISTS distance_km;
+ALTER TABLE geofences DROP COLUMN IF EXISTS kind;
+DROP TYPE IF EXISTS geofence_kind;

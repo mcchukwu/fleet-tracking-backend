@@ -330,6 +330,7 @@ paths:
                   active_trips: { type: integer }
                   alerts: { type: integer }
                   open_alerts: { type: integer }
+                  distance_km: { type: number }
                   alerts_by_type:
                     type: array
                     items:
@@ -506,6 +507,7 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
+        distance_km: { type: number }
         vehicle_id: { type: string, format: uuid }
         plate: { type: string }
         driver_id: { type: string, format: uuid }
@@ -563,12 +565,14 @@ components:
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        kind: { type: string, enum: [depot, customer, restricted, other] }
         geometry: { $ref: '#/components/schemas/Polygon' }
     GeofenceInput:
       type: object
       required: [name, geometry]
       properties:
         name: { type: string }
+        kind: { type: string, enum: [depot, customer, restricted, other] }
         geometry: { $ref: '#/components/schemas/Polygon' }
     Polygon:
       type: object

@@ -15,6 +15,7 @@ type trip struct {
 	Origin      string  `json:"origin"`
 	Destination string  `json:"destination"`
 	Status      string  `json:"status"`
+	DistanceKM  float64 `json:"distance_km"`
 	StartedAt   *string `json:"started_at,omitempty"`
 	EndedAt     *string `json:"ended_at,omitempty"`
 }
@@ -34,7 +35,7 @@ func (s *Server) listTrips(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT t.id, t.vehicle_id, COALESCE(v.plate, ''), t.driver_id, COALESCE(d.name, ''),
-		       t.origin, t.destination, t.status, t.started_at, t.ended_at
+		       t.origin, t.destination, t.status, COALESCE(t.distance_km, 0), t.started_at, t.ended_at
 		FROM trips t
 		JOIN vehicles v ON v.id = t.vehicle_id
 		LEFT JOIN drivers d ON d.id = t.driver_id
@@ -55,7 +56,7 @@ func (s *Server) listTrips(w http.ResponseWriter, r *http.Request) {
 		var driverID, driverName sql.NullString
 		var started, ended sql.NullTime
 		if err := rows.Scan(&t.ID, &t.VehicleID, &t.Plate, &driverID, &driverName,
-			&t.Origin, &t.Destination, &t.Status, &started, &ended); err != nil {
+			&t.Origin, &t.Destination, &t.Status, &t.DistanceKM, &started, &ended); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "could not read trips")
 			return
 		}
@@ -122,12 +123,44 @@ func (s *Server) updateTrip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Status == "completed" {
+		tag, err := s.db.ExecContext(r.Context(), `
+			UPDATE trips t SET
+				status = 'completed',
+				driver_id = COALESCE(NULLIF($3, '')::uuid, t.driver_id),
+				ended_at = now(),
+				distance_km = COALESCE((
+					SELECT SUM(ST_Distance(prev, location)) / 1000.0
+					FROM (
+						SELECT location, lag(location) OVER (ORDER BY recorded_at) AS prev
+						FROM position_history
+						WHERE tenant_id = t.tenant_id AND vehicle_id = t.vehicle_id
+						  AND recorded_at BETWEEN COALESCE(t.started_at, t.created_at) AND now()
+					) points
+					WHERE prev IS NOT NULL
+				), 0),
+				updated_at = now()
+			WHERE t.id = $1 AND t.tenant_id = $2
+		`, r.PathValue("id"), user.TenantID, req.DriverID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not complete trip")
+			return
+		}
+		if n, _ := tag.RowsAffected(); n == 0 {
+			writeError(w, http.StatusNotFound, "not_found", "trip not found")
+			return
+		}
+		s.audit(r, user.TenantID, user.ID, "trip.complete", "trip", r.PathValue("id"), nil)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	tag, err := s.db.ExecContext(r.Context(), `
 		UPDATE trips SET
 			status = COALESCE(NULLIF($3, '')::trip_status, status),
 			driver_id = COALESCE(NULLIF($4, '')::uuid, driver_id),
 			started_at = CASE WHEN $3 = 'active' AND started_at IS NULL THEN now() ELSE started_at END,
-			ended_at = CASE WHEN $3 IN ('completed', 'cancelled') THEN now() ELSE ended_at END,
+			ended_at = CASE WHEN $3 = 'cancelled' THEN now() ELSE ended_at END,
 			updated_at = now()
 		WHERE id = $1 AND tenant_id = $2
 	`, r.PathValue("id"), user.TenantID, req.Status, req.DriverID)

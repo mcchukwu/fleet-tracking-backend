@@ -1,13 +1,11 @@
-// Load generator, extended with a storm mode
-// (reconnect-storm defence) and, now, device authentication: every
-// simulated vehicle dials with an Authorization bearer token and an
-// X-Device-ID header, matching what cmd/ingest now requires. Without
-// -api-key set to a valid key for the target tenant, every connection
-// will be rejected with 401, that's the server behaving correctly, not
-// a bug in this tool.
+// Load generator, extended with a storm mode (reconnect-storm defence)
+// and device authentication: every simulated vehicle dials with
+// an Authorization bearer token and an X-Device-ID header,
+// matching what cmd/ingest now requires. Without -api-key set
+// to a valid key for the target tenant, every connection
+// will be rejected with 401.
 //
-// this drives the WebSocket simulator
-// adapter, not a real-hardware interface.
+// this drives the WebSocket simulator adapter.
 package main
 
 import (

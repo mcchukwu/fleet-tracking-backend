@@ -8,7 +8,16 @@ import (
 
 type geofenceRequest struct {
 	Name     string          `json:"name"`
+	Kind     string          `json:"kind"`
 	Geometry json.RawMessage `json:"geometry"`
+}
+
+func validGeofenceKind(kind string) bool {
+	switch kind {
+	case "", "depot", "customer", "restricted", "other":
+		return true
+	}
+	return false
 }
 
 func (s *Server) createGeofence(w http.ResponseWriter, r *http.Request) {
@@ -18,15 +27,22 @@ func (s *Server) createGeofence(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "name and geometry are required")
 		return
 	}
+	if !validGeofenceKind(req.Kind) {
+		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be depot, customer, restricted or other")
+		return
+	}
+	if req.Kind == "" {
+		req.Kind = "other"
+	}
 
 	var id string
 	err := s.db.QueryRowContext(r.Context(), `
-		INSERT INTO geofences (tenant_id, name, boundary)
-		SELECT $1, $2, ST_SetSRID(ST_GeomFromGeoJSON($3), 4326)::geography
+		INSERT INTO geofences (tenant_id, name, boundary, kind)
+		SELECT $1, $2, ST_SetSRID(ST_GeomFromGeoJSON($3), 4326)::geography, $4::geofence_kind
 		WHERE ST_IsValid(ST_SetSRID(ST_GeomFromGeoJSON($3), 4326))
 		  AND ST_GeometryType(ST_SetSRID(ST_GeomFromGeoJSON($3), 4326)) = 'ST_Polygon'
 		RETURNING id
-	`, user.TenantID, req.Name, string(req.Geometry)).Scan(&id)
+	`, user.TenantID, req.Name, string(req.Geometry), req.Kind).Scan(&id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_geometry", "geometry must be a valid polygon")
 		return
@@ -43,8 +59,12 @@ func (s *Server) updateGeofence(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "invalid body")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" && len(req.Geometry) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "name or geometry is required")
+	if strings.TrimSpace(req.Name) == "" && len(req.Geometry) == 0 && req.Kind == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "name, geometry or kind is required")
+		return
+	}
+	if !validGeofenceKind(req.Kind) {
+		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be depot, customer, restricted or other")
 		return
 	}
 
@@ -53,15 +73,18 @@ func (s *Server) updateGeofence(w http.ResponseWriter, r *http.Request) {
 	if len(req.Geometry) > 0 {
 		query = `
 			UPDATE geofences SET name = COALESCE(NULLIF($3, ''), name),
-				boundary = ST_SetSRID(ST_GeomFromGeoJSON($4), 4326)::geography
+				boundary = ST_SetSRID(ST_GeomFromGeoJSON($4), 4326)::geography,
+				kind = COALESCE(NULLIF($5, '')::geofence_kind, kind)
 			WHERE id = $1 AND tenant_id = $2
 			  AND ST_IsValid(ST_SetSRID(ST_GeomFromGeoJSON($4), 4326))
 			  AND ST_GeometryType(ST_SetSRID(ST_GeomFromGeoJSON($4), 4326)) = 'ST_Polygon'
 		`
-		args = []any{r.PathValue("id"), user.TenantID, req.Name, string(req.Geometry)}
+		args = []any{r.PathValue("id"), user.TenantID, req.Name, string(req.Geometry), req.Kind}
 	} else {
-		query = `UPDATE geofences SET name = COALESCE(NULLIF($3, ''), name) WHERE id = $1 AND tenant_id = $2`
-		args = []any{r.PathValue("id"), user.TenantID, req.Name}
+		query = `UPDATE geofences SET name = COALESCE(NULLIF($3, ''), name),
+			kind = COALESCE(NULLIF($4, '')::geofence_kind, kind)
+			WHERE id = $1 AND tenant_id = $2`
+		args = []any{r.PathValue("id"), user.TenantID, req.Name, req.Kind}
 	}
 	tag, err := s.db.ExecContext(r.Context(), query, args...)
 	if err != nil {

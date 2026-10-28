@@ -1,6 +1,6 @@
 BIN_PATH := bin
 
-.PHONY: run api simulator build clean test vet migrate seed seed-device seed-console bootstrap dev integration
+.PHONY: run api simulator wsprobe maintenance build clean test vet migrate seed seed-device seed-console bootstrap dev integration
 
 run:
 	go run ./cmd/ingest
@@ -28,6 +28,12 @@ api:
 
 simulator:
 	go run ./cmd/simulator
+
+wsprobe:
+	go run ./cmd/wsprobe
+
+maintenance:
+	go run ./cmd/maintenance
 
 seed-device:
 	set -a; . ./.env; set +a; \

@@ -45,6 +45,9 @@ func loadRules(ctx context.Context, pg *sql.DB, tenantID string) map[string]rule
 		return rules
 	}
 	defer rows.Close()
+	if rows.Err() != nil {
+		return rules
+	}
 	for rows.Next() {
 		var kind string
 		var enabled bool
@@ -74,6 +77,7 @@ func (r rule) or(defaults rule) rule {
 }
 
 func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog.Logger) {
+	unplannedTripAlerts(ctx, pg, log)
 	rows, err := pg.QueryContext(ctx, `
 		SELECT t.id, t.tenant_id, t.vehicle_id, v.external_id, t.planned_route IS NOT NULL
 		FROM trips t
@@ -92,6 +96,10 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 		}
 	}
 	rows.Close()
+	if rows.Err() != nil {
+		log.Error("alert rules: active trips query failed", "error", err)
+		return
+	}
 
 	rulesByTenant := map[string]map[string]rule{}
 	now := time.Now()
@@ -167,17 +175,59 @@ func evaluateRules(ctx context.Context, rdb *redis.Client, pg *sql.DB, log *slog
 }
 
 func raiseAlert(ctx context.Context, pg *sql.DB, trip activeTrip, kind, severity string, at time.Time, evidence map[string]any) {
+	insertAlert(ctx, pg, trip.tenantID, trip.vehicleUUID, trip.id, trip.externalID, kind, severity, at, evidence)
+}
+
+func insertAlert(ctx context.Context, pg *sql.DB, tenantID, vehicleUUID, tripID, externalID, kind, severity string, at time.Time, evidence map[string]any) {
 	if at.IsZero() {
 		at = time.Now()
 	}
 	payload, _ := json.Marshal(evidence)
 	_, err := pg.ExecContext(ctx, `
 		INSERT INTO alerts (tenant_id, vehicle_id, trip_id, type, severity, occurred_at, evidence)
-		VALUES ($1, $2, $3, $4::alert_type, $5::alert_severity, $6, $7::jsonb)
+		VALUES ($1, $2, NULLIF($3, '')::uuid, $4::alert_type, $5::alert_severity, $6, $7::jsonb)
 		ON CONFLICT DO NOTHING
-	`, trip.tenantID, trip.vehicleUUID, trip.id, kind, severity, at, string(payload))
+	`, tenantID, vehicleUUID, tripID, kind, severity, at, string(payload))
 	if err != nil {
-		slog.Default().Error("alert insert failed", "type", kind, "vehicle", trip.externalID, "error", err)
+		slog.Default().Error("alert insert failed", "type", kind, "vehicle", externalID, "error", err)
+	}
+}
+
+// unplannedTripAlerts looks for a depot exit with no assigned or active
+// trip. That is the case dispatch usually misses.
+func unplannedTripAlerts(ctx context.Context, pg *sql.DB, log *slog.Logger) {
+	rows, err := pg.QueryContext(ctx, `
+		SELECT e.tenant_id, e.vehicle_id, v.external_id, g.id, g.name, e.event_time
+		FROM geofence_events e
+		JOIN geofences g ON g.id = e.geofence_id
+		JOIN vehicles v ON v.id = e.vehicle_id
+		WHERE e.event_type = 'exit'
+		  AND g.kind = 'depot'
+		  AND e.event_time > now() - interval '2 minutes'
+		  AND NOT EXISTS (
+			  SELECT 1 FROM trips t
+			  WHERE t.vehicle_id = e.vehicle_id AND t.status IN ('assigned', 'active')
+		  )
+	`)
+	if err != nil {
+		log.Error("unplanned trip query failed", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tenantID, vehicleID, externalID, geofenceID, name string
+		var at time.Time
+		if rows.Scan(&tenantID, &vehicleID, &externalID, &geofenceID, &name, &at) != nil {
+			continue
+		}
+		rules := loadRules(ctx, pg, tenantID)
+		if r, ok := rules["unplanned_trip"]; ok && !r.enabled {
+			continue
+		}
+		insertAlert(ctx, pg, tenantID, vehicleID, "", externalID, "unplanned_trip", "high", at, map[string]any{
+			"geofence_id": geofenceID, "geofence_name": name,
+		})
 	}
 }
 

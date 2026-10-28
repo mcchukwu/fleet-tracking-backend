@@ -21,11 +21,13 @@ func (s *Server) reportSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var vehicles, trips, completed, active, alerts, open int
+	var distance float64
 	_ = s.db.QueryRowContext(r.Context(), `SELECT count(*) FROM vehicles WHERE tenant_id = $1 AND disabled_at IS NULL`, user.TenantID).Scan(&vehicles)
 	_ = s.db.QueryRowContext(r.Context(), `
-		SELECT count(*), count(*) FILTER (WHERE status = 'completed'), count(*) FILTER (WHERE status = 'active')
+		SELECT count(*), count(*) FILTER (WHERE status = 'completed'), count(*) FILTER (WHERE status = 'active'),
+		       COALESCE(SUM(distance_km) FILTER (WHERE status = 'completed'), 0)
 		FROM trips WHERE tenant_id = $1 AND created_at BETWEEN $2 AND $3
-	`, user.TenantID, from, to).Scan(&trips, &completed, &active)
+	`, user.TenantID, from, to).Scan(&trips, &completed, &active, &distance)
 	_ = s.db.QueryRowContext(r.Context(), `
 		SELECT count(*), count(*) FILTER (WHERE status = 'open')
 		FROM alerts WHERE tenant_id = $1 AND occurred_at BETWEEN $2 AND $3
@@ -54,7 +56,7 @@ func (s *Server) reportSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"from": from, "to": to,
 		"vehicles": vehicles, "trips": trips, "completed_trips": completed,
-		"active_trips": active, "alerts": alerts, "open_alerts": open,
+		"active_trips": active, "alerts": alerts, "open_alerts": open, "distance_km": distance,
 		"alerts_by_type": byType,
 	})
 }

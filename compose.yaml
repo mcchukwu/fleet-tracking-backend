@@ -43,6 +43,72 @@ services:
       timeout: 3s
       retries: 10
 
+  migrate:
+    build: .
+    profiles: ["app"]
+    entrypoint: ["/app/migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+
+  ingest:
+    build: .
+    profiles: ["app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LISTEN_ADDR: ":8080"
+      ADMIN_ADDR: ":9090"
+      OVERFLOW_POLICY: ${OVERFLOW_POLICY:-drop_oldest}
+      IDLE_TIMEOUT: ${IDLE_TIMEOUT:-90s}
+      ACCEPT_RATE: ${ACCEPT_RATE:-500}
+      ACCEPT_BURST: ${ACCEPT_BURST:-200}
+      PER_IP_RATE: ${PER_IP_RATE:-10}
+      PER_IP_BURST: ${PER_IP_BURST:-20}
+      COLDPATH_BATCH_WINDOW: ${COLDPATH_BATCH_WINDOW:-1s}
+      COLDPATH_BATCH_SIZE: ${COLDPATH_BATCH_SIZE:-500}
+    ports:
+      - "8080:8080"
+
+  maintenance:
+    build: .
+    profiles: ["app"]
+    entrypoint: ["/app/maintenance"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      RETENTION_DAYS: ${RETENTION_DAYS:-60}
+
+  api:
+    build: .
+    profiles: ["app"]
+    entrypoint: ["/app/api"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      API_ADDR: ":8081"
+      SESSION_TTL: ${SESSION_TTL:-12h}
+      COOKIE_SECURE: "false"
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-localhost:*,127.0.0.1:*}
+    ports:
+      - "8081:8081"
+
 volumes:
   postgres_data:
   redis_data:

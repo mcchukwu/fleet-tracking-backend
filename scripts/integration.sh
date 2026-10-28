@@ -31,11 +31,16 @@ api_log="$(mktemp /tmp/fleet-tracking-api.XXXXXX.log)"
 API_ADDR=127.0.0.1:9091 COOKIE_SECURE=false go run ./cmd/api >"$api_log" 2>&1 &
 api_pid=$!
 
+sim_log="$(mktemp /tmp/fleet-tracking-sim.XXXXXX.log)"
+go run ./cmd/simulator -ws-url ws://localhost:8080/ws/ingest -count 3 -interval 1s >"$sim_log" 2>&1 &
+sim_pid=$!
+
 cleanup() {
-  kill "$api_pid" "$server_pid" 2>/dev/null || true
+  kill "$sim_pid" "$api_pid" "$server_pid" 2>/dev/null || true
+  wait "$sim_pid" 2>/dev/null || true
   wait "$api_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
-  rm -f "$server_log" "$api_log"
+  rm -f "$server_log" "$api_log" "$sim_log"
 }
 trap cleanup EXIT
 

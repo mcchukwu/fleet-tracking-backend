@@ -63,7 +63,9 @@ History and event rows carry `tenant_id` and composite foreign keys to `vehicles
 
 Ingest publishes each live update to the Redis channel `ftb:live`; the API subscribes and filters by the user's tenant before writing to `/api/v1/live/ws`. Geofence writes bump `ftb:geofence_version`; ingest polls that key and reloads its in-memory cache, so a geofence change does not need a restart.
 
-The alert worker runs in ingest every 15 seconds against active trips: device offline, speeding, route deviation and idle. Geofence enter/exit alerts come from the pipeline itself. Alert rows are deduplicated by a partial unique index on open alerts per vehicle and type.
+The alert worker runs in ingest every 15 seconds against active trips: device offline, speeding, route deviation and idle. Geofence enter/exit alerts come from the pipeline itself. A depot exit with no assigned or active trip raises an unplanned-trip alert. Thresholds and enable flags come from `alert_rules`. Alert rows are deduplicated by a partial unique index on open alerts per vehicle and type.
+
+Trip distance is computed from ordered positions when a trip is completed and stored on the trip. `cmd/maintenance` deletes positions older than the retention window in batches, plus expired sessions and old import jobs.
 
 ## Failure behaviour
 
