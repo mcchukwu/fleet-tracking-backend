@@ -53,6 +53,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/vehicles", s.auth(http.HandlerFunc(s.listVehicles)))
 	mux.Handle("GET /api/v1/vehicles/{id}", s.auth(http.HandlerFunc(s.getVehicle)))
 	mux.Handle("GET /api/v1/vehicles/{id}/history", s.auth(http.HandlerFunc(s.vehicleHistory)))
+	mux.Handle("GET /api/v1/vehicles/{id}/events", s.auth(http.HandlerFunc(s.vehicleEvents)))
+	mux.Handle("PATCH /api/v1/vehicles/{id}", s.auth(s.role(http.HandlerFunc(s.updateVehicle), identity.RoleAdmin, identity.RoleDispatcher)))
 	mux.Handle("GET /api/v1/live/snapshot", s.auth(http.HandlerFunc(s.liveSnapshot)))
 	mux.Handle("GET /api/v1/geofences", s.auth(http.HandlerFunc(s.listGeofences)))
 	mux.Handle("GET /api/v1/system/health", s.auth(http.HandlerFunc(s.systemHealth)))
@@ -74,6 +76,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/import/vehicles", s.auth(s.role(http.HandlerFunc(s.importVehicles), identity.RoleAdmin, identity.RoleDispatcher)))
 	mux.Handle("GET /api/v1/live/ws", s.auth(http.HandlerFunc(s.liveWS)))
 	mux.Handle("GET /api/v1/drivers", s.auth(http.HandlerFunc(s.listDrivers)))
+	mux.Handle("POST /api/v1/drivers", s.auth(s.role(http.HandlerFunc(s.createDriver), identity.RoleAdmin, identity.RoleDispatcher)))
+	mux.Handle("PATCH /api/v1/drivers/{id}", s.auth(s.role(http.HandlerFunc(s.updateDriver), identity.RoleAdmin, identity.RoleDispatcher)))
 	mux.Handle("GET /api/v1/audit", s.auth(s.role(http.HandlerFunc(s.listAudit), identity.RoleAdmin, identity.RoleSecurity)))
 
 	var handler http.Handler = mux

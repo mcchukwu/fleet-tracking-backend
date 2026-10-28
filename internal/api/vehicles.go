@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -360,4 +362,177 @@ func (s *Server) systemHealth(w http.ResponseWriter, r *http.Request) {
 		"open_alerts":  openAlerts,
 		"ingest":       ingest,
 	})
+}
+
+type vehicleUpdate struct {
+	Plate       *string `json:"plate"`
+	DriverID    *string `json:"driver_id"`
+	Status      *string `json:"status"`
+	VehicleType *string `json:"vehicle_type"`
+	Make        *string `json:"make"`
+	Model       *string `json:"model"`
+	Year        *int    `json:"year"`
+	Colour      *string `json:"colour"`
+	Depot       *string `json:"depot"`
+	Department  *string `json:"department"`
+	SimNumber   *string `json:"sim_number"`
+	DeviceModel *string `json:"device_model"`
+	Protocol    *string `json:"protocol"`
+}
+
+func (s *Server) updateVehicle(w http.ResponseWriter, r *http.Request) {
+	user := userFrom(r.Context())
+	var req vehicleUpdate
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid body")
+		return
+	}
+
+	sets := []string{}
+	args := []any{r.PathValue("id"), user.TenantID}
+	add := func(expr string, value any) {
+		args = append(args, value)
+		sets = append(sets, fmt.Sprintf(expr, len(args)))
+	}
+	if req.Plate != nil {
+		add("plate = NULLIF($%d, '')", *req.Plate)
+	}
+	if req.DriverID != nil {
+		add("current_driver_id = NULLIF($%d, '')::uuid", *req.DriverID)
+	}
+	if req.Status != nil {
+		switch *req.Status {
+		case "active", "maintenance", "inactive":
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_status", "status must be active, maintenance or inactive")
+			return
+		}
+		add("status = $%d", *req.Status)
+	}
+	if req.VehicleType != nil {
+		add("vehicle_type = NULLIF($%d, '')", *req.VehicleType)
+	}
+	if req.Make != nil {
+		add("make = NULLIF($%d, '')", *req.Make)
+	}
+	if req.Model != nil {
+		add("model = NULLIF($%d, '')", *req.Model)
+	}
+	if req.Year != nil {
+		add("year = NULLIF($%d, 0)", *req.Year)
+	}
+	if req.Colour != nil {
+		add("colour = NULLIF($%d, '')", *req.Colour)
+	}
+	if req.Depot != nil {
+		add("depot = NULLIF($%d, '')", *req.Depot)
+	}
+	if req.Department != nil {
+		add("department = NULLIF($%d, '')", *req.Department)
+	}
+	if req.SimNumber != nil {
+		add("sim_number = NULLIF($%d, '')", *req.SimNumber)
+	}
+	if req.DeviceModel != nil {
+		add("device_model = NULLIF($%d, '')", *req.DeviceModel)
+	}
+	if req.Protocol != nil {
+		add("protocol = NULLIF($%d, '')", *req.Protocol)
+	}
+	if len(sets) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "no fields to update")
+		return
+	}
+
+	query := "UPDATE vehicles SET " + strings.Join(sets, ", ") + " WHERE id = $1 AND tenant_id = $2"
+	tag, err := s.db.ExecContext(r.Context(), query, args...)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_update", "could not update vehicle")
+		return
+	}
+	if n, _ := tag.RowsAffected(); n == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "vehicle not found")
+		return
+	}
+	s.audit(r, user.TenantID, user.ID, "vehicle.update", "vehicle", r.PathValue("id"), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type vehicleEvent struct {
+	Kind     string          `json:"kind"`
+	Type     string          `json:"type"`
+	Name     string          `json:"name,omitempty"`
+	Severity string          `json:"severity,omitempty"`
+	Status   string          `json:"status,omitempty"`
+	At       string          `json:"at"`
+	Evidence json.RawMessage `json:"evidence,omitempty"`
+}
+
+func (s *Server) vehicleEvents(w http.ResponseWriter, r *http.Request) {
+	user := userFrom(r.Context())
+	to := time.Now().UTC()
+	from := to.Add(-7 * 24 * time.Hour)
+	if v := r.URL.Query().Get("from"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			from = t
+		}
+	}
+	if v := r.URL.Query().Get("to"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			to = t
+		}
+	}
+
+	var exists bool
+	if err := s.db.QueryRowContext(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM vehicles WHERE id = $1 AND tenant_id = $2)`,
+		r.PathValue("id"), user.TenantID).Scan(&exists); err != nil || !exists {
+		writeError(w, http.StatusNotFound, "not_found", "vehicle not found")
+		return
+	}
+
+	out := []vehicleEvent{}
+	rows, err := s.db.QueryContext(r.Context(), `
+		SELECT e.event_type::text, g.name, e.event_time
+		FROM geofence_events e
+		JOIN geofences g ON g.id = e.geofence_id
+		WHERE e.tenant_id = $1 AND e.vehicle_id = $2 AND e.event_time BETWEEN $3 AND $4
+		ORDER BY e.event_time DESC LIMIT 500
+	`, user.TenantID, r.PathValue("id"), from, to)
+	if err == nil {
+		for rows.Next() {
+			var ev vehicleEvent
+			var at time.Time
+			if rows.Scan(&ev.Type, &ev.Name, &at) == nil {
+				ev.Kind = "geofence"
+				ev.At = at.UTC().Format(time.RFC3339)
+				out = append(out, ev)
+			}
+		}
+		rows.Close()
+	}
+
+	rows, err = s.db.QueryContext(r.Context(), `
+		SELECT type::text, severity::text, status::text, occurred_at, evidence
+		FROM alerts
+		WHERE tenant_id = $1 AND vehicle_id = $2 AND occurred_at BETWEEN $3 AND $4
+		ORDER BY occurred_at DESC LIMIT 500
+	`, user.TenantID, r.PathValue("id"), from, to)
+	if err == nil {
+		for rows.Next() {
+			var ev vehicleEvent
+			var at time.Time
+			var evidence []byte
+			if rows.Scan(&ev.Type, &ev.Severity, &ev.Status, &at, &evidence) == nil {
+				ev.Kind = "alert"
+				ev.At = at.UTC().Format(time.RFC3339)
+				ev.Evidence = json.RawMessage(evidence)
+				out = append(out, ev)
+			}
+		}
+		rows.Close()
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].At > out[j].At })
+	writeJSON(w, http.StatusOK, map[string]any{"data": out})
 }

@@ -95,6 +95,40 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Vehicle' }
         '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Update vehicle fields
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleUpdate' }
+      responses:
+        '204': { description: Updated }
+  /vehicles/{id}/events:
+    get:
+      summary: Geofence events and alerts for one vehicle
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Events, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VehicleEvent' }
   /vehicles/{id}/history:
     get:
       summary: Position history
@@ -352,6 +386,36 @@ paths:
                   data:
                     type: array
                     items: { $ref: '#/components/schemas/Driver' }
+    post:
+      summary: Create a driver
+      parameters:
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DriverInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+  /drivers/{id}:
+    patch:
+      summary: Update a driver
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DriverUpdate' }
+      responses:
+        '204': { description: Updated }
   /audit:
     get:
       summary: Recent user actions
@@ -544,6 +608,46 @@ components:
         occurred_at: { type: string, format: date-time }
         acked_at: { type: string, format: date-time }
         evidence: { type: object }
+    VehicleUpdate:
+      type: object
+      properties:
+        plate: { type: string }
+        driver_id: { type: string, format: uuid }
+        status: { type: string, enum: [active, maintenance, inactive] }
+        vehicle_type: { type: string }
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer }
+        colour: { type: string }
+        depot: { type: string }
+        department: { type: string }
+        sim_number: { type: string }
+        device_model: { type: string }
+        protocol: { type: string }
+    VehicleEvent:
+      type: object
+      properties:
+        kind: { type: string, enum: [geofence, alert] }
+        type: { type: string }
+        name: { type: string }
+        severity: { type: string }
+        status: { type: string }
+        at: { type: string, format: date-time }
+        evidence: { type: object }
+    DriverInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        licence: { type: string }
+    DriverUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        licence: { type: string }
+        status: { type: string, enum: [active, inactive] }
     Driver:
       type: object
       properties:

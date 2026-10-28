@@ -112,6 +112,23 @@ if [[ "$imported" -ne 2 ]]; then
   exit 1
 fi
 
+vehicle_id="$(curl --silent --cookie "$jar" 'http://localhost:9091/api/v1/vehicles?limit=1' | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
+driver_id="$(curl --silent --cookie "$jar" -X POST http://localhost:9091/api/v1/drivers \
+  -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d '{"name":"Integration Driver","phone":"08130000002"}' | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+driver_patch="$(curl --silent -o /dev/null -w '%{http_code}' --cookie "$jar" -X PATCH \
+  "http://localhost:9091/api/v1/drivers/$driver_id" -H "X-CSRF-Token: $csrf" \
+  -H 'Content-Type: application/json' -d '{"licence":"INT-0001"}')"
+vehicle_patch="$(curl --silent -o /dev/null -w '%{http_code}' --cookie "$jar" -X PATCH \
+  "http://localhost:9091/api/v1/vehicles/$vehicle_id" -H "X-CSRF-Token: $csrf" \
+  -H 'Content-Type: application/json' -d '{"depot":"Integration Depot"}')"
+if [[ "$driver_patch" != "204" || "$vehicle_patch" != "204" ]]; then
+  echo "update check failed: driver=$driver_patch vehicle=$vehicle_patch" >&2
+  exit 1
+fi
+
 sleep 2
 ws="$(go run ./cmd/wsprobe -api-url http://localhost:9091 2>&1)"
 if [[ "$ws" != ok* ]]; then
@@ -119,4 +136,4 @@ if [[ "$ws" != ok* ]]; then
   exit 1
 fi
 
-echo "PASS. integration: positions=$positions events=$events api_vehicles=$vehicles imported=$imported ws=$ws"
+echo "PASS. integration: positions=$positions events=$events api_vehicles=$vehicles imported=$imported updates=ok ws=$ws"
