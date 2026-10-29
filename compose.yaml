@@ -104,6 +104,15 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       API_ADDR: ":8081"
 
+  simulator:
+    build: .
+    profiles: ["demo"]
+    entrypoint: ["/app/simulator"]
+    command: ["-ws-url", "ws://ingest:8080/ws/ingest", "-count", "20", "-interval", "1s"]
+    depends_on:
+      ingest:
+        condition: service_started
+
   api:
     build: .
     profiles: ["app"]

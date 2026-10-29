@@ -9,6 +9,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/maintenance ./cmd/maintenance
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/seed ./cmd/seed
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/simulator ./cmd/simulator
 
 FROM alpine:3.22
 
@@ -17,7 +18,7 @@ RUN apk add --no-cache ca-certificates \
     && adduser -S -G app app
 
 WORKDIR /app
-COPY --from=build /out/ingest /out/api /out/migrate /out/maintenance /out/seed ./
+COPY --from=build /out/ingest /out/api /out/migrate /out/maintenance /out/seed /out/simulator ./
 COPY migrations ./migrations
 
 USER app

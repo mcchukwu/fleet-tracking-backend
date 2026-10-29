@@ -131,7 +131,7 @@ On `SIGTERM` or `SIGINT` the process closes device connections, stops the pipeli
 If a start fails with `network ... not found`, stale containers are attached to a removed network:
 
 ```bash
-docker compose --profile app down --remove-orphans
+docker compose --profile app --profile demo down --remove-orphans
 docker compose --profile app --profile demo up -d --build
 ```
 
@@ -161,7 +161,7 @@ Live feed probe, useful when the frontend WebSocket stops updating:
 make wsprobe       # logs in, connects to /api/v1/live/ws, expects one frame
 ```
 
-Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately. For a demo dataset, add the `demo` profile: `docker compose --profile app --profile demo up --build`.
+Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately. For a demo dataset and a moving simulator, add the `demo` profile: `docker compose --profile app --profile demo up --build`.
 
 ## Limits
 
