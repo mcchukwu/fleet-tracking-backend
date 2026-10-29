@@ -63,6 +63,12 @@ func main() {
 		log.Error("commit", "error", err)
 		os.Exit(1)
 	}
+
+	if rdb, err := db.ConnectRedis(cfg.RedisAddr, cfg.RedisPassword); err == nil {
+		_ = rdb.Incr(ctx, "ftb:geofence_version").Err()
+		_ = rdb.Close()
+	}
+
 	fmt.Println("seeded Demo Fleet")
 	fmt.Printf("login: dispatcher@demo.ftb / %s\n", demoPassword)
 	fmt.Println("device key: demo-device-key")

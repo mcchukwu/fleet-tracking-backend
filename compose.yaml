@@ -91,6 +91,19 @@ services:
       PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
       RETENTION_DAYS: ${RETENTION_DAYS:-60}
 
+  seed:
+    build: .
+    profiles: ["demo"]
+    entrypoint: ["/app/seed"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PG_DSN: postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      API_ADDR: ":8081"
+
   api:
     build: .
     profiles: ["app"]

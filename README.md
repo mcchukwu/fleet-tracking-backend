@@ -126,6 +126,19 @@ The cold path batches positions and events into Postgres. A failed batch is retr
 
 On `SIGTERM` or `SIGINT` the process closes device connections, stops the pipeline, flushes the cold path, then closes the database.
 
+### Compose trouble
+
+If a start fails with `network ... not found`, stale containers are attached to a removed network:
+
+```bash
+docker compose --profile app down --remove-orphans
+docker compose --profile app --profile demo up -d --build
+```
+
+If port `8080` or `8081` is busy, a local `go run` process is still holding it: `fuser -k 8080/tcp 8081/tcp`.
+
+The `app` profile does not seed. Add `--profile demo` for the Demo Fleet dataset, or run `make seed` once the database is up.
+
 ## Tests
 
 ```bash
@@ -148,7 +161,7 @@ Live feed probe, useful when the frontend WebSocket stops updating:
 make wsprobe       # logs in, connects to /api/v1/live/ws, expects one frame
 ```
 
-Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately.
+Run it daily from cron or a systemd timer. `docker compose --profile app up --build` runs Postgres, Redis, migrations, ingest and the API in containers; the SPA is served separately. For a demo dataset, add the `demo` profile: `docker compose --profile app --profile demo up --build`.
 
 ## Limits
 
