@@ -67,6 +67,8 @@ RETENTION_DAYS=60
 
 The API host is `DOMAIN`. Caddy obtains a certificate automatically. For a hostname without a domain, use `<name>.<server-ip>.sslip.io`; it resolves to the IP.
 
+Use a URL-safe database password (letters, digits, `-`, `_`). `PG_DSN` is a URL, so `@`, `:`, `/` and `#` in a password must be percent-encoded.
+
 ## Demo deployment
 
 ```bash
