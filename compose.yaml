@@ -77,8 +77,8 @@ services:
       PER_IP_BURST: ${PER_IP_BURST:-20}
       COLDPATH_BATCH_WINDOW: ${COLDPATH_BATCH_WINDOW:-1s}
       COLDPATH_BATCH_SIZE: ${COLDPATH_BATCH_SIZE:-500}
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
 
   maintenance:
     build: .
@@ -126,11 +126,33 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       API_ADDR: ":8081"
       SESSION_TTL: ${SESSION_TTL:-12h}
-      COOKIE_SECURE: "false"
-      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-localhost:*,127.0.0.1:*}
+      COOKIE_SECURE: "true"
+      WS_ALLOWED_ORIGINS: ${DOMAIN:-localhost}
+    expose:
+      - "8081"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["app"]
+    depends_on:
+      api:
+        condition: service_started
+      ingest:
+        condition: service_started
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
     ports:
-      - "8081:8081"
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/site:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
 
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:

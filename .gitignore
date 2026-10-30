@@ -15,3 +15,6 @@ logs
 # Others
 captures/
 *.bin
+
+# Database dumps
+backups/

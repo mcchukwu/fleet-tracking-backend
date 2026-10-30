@@ -78,7 +78,7 @@ The API is a separate binary (`cmd/api`) on `API_ADDR`. It reads Redis for live 
 | Audit | `GET /audit` (admin, security) |
 | System | `GET /system/health` |
 
-The OpenAPI description is in [openapi.yaml](openapi.yaml). The frontend handoff is [docs/frontend-integration.md](docs/frontend-integration.md); the screen brief is [docs/ui-brief.md](docs/ui-brief.md). Roles: `admin` and `dispatcher` can mutate; `security` can acknowledge alerts; `viewer` is read-only. Every query is scoped to the logged-in user's tenant.
+The OpenAPI description is in [openapi.yaml](openapi.yaml). The frontend handoff is [docs/frontend-integration.md](docs/frontend-integration.md); the screen brief is [docs/ui-brief.md](docs/ui-brief.md); deployment is [docs/deployment.md](docs/deployment.md). Roles: `admin` and `dispatcher` can mutate; `security` can acknowledge alerts; `viewer` is read-only. Every query is scoped to the logged-in user's tenant.
 
 ## Endpoints
 

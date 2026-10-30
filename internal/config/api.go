@@ -73,3 +73,15 @@ func splitList(raw string) []string {
 	}
 	return out
 }
+
+// LoadDatabase is for one-shot commands that only need Postgres.
+func LoadDatabase() (string, error) {
+	if err := loadEnv(); err != nil {
+		return "", err
+	}
+	dsn := getenv("PG_DSN", "")
+	if dsn == "" {
+		return "", fmt.Errorf("PG_DSN is required")
+	}
+	return dsn, nil
+}
