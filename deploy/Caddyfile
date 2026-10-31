@@ -8,6 +8,14 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 
+	handle /healthz {
+		reverse_proxy api:8081
+	}
+
+	handle /readyz {
+		reverse_proxy api:8081
+	}
+
 	handle /api/* {
 		reverse_proxy api:8081
 	}
