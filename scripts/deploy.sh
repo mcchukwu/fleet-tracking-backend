@@ -29,9 +29,11 @@ if ! docker compose -p "$project" --profile app --profile demo up -d --build; th
   echo "deploy failed; rolling back to $previous" >&2
   git checkout --force "$previous"
   docker compose -p "$project" --profile app --profile demo up -d --build || true
+  docker compose -p "$project" --profile app restart caddy || true
   exit 1
 fi
 
+docker compose -p "$project" --profile app restart caddy
 sleep 10
 curl_args=(-fsS)
 if [[ "${CURL_INSECURE:-0}" == "1" ]]; then
@@ -41,6 +43,7 @@ if ! curl "${curl_args[@]}" "https://${DOMAIN}/readyz" >/dev/null; then
   echo "health check failed; rolling back to $previous" >&2
   git checkout --force "$previous"
   docker compose -p "$project" --profile app --profile demo up -d --build || true
+  docker compose -p "$project" --profile app restart caddy || true
   exit 1
 fi
 
